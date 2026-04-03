@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
-use crate::app::{App, SystemAnnotation, SystemMessageStyle, ToolStatus, ContextMenuState, ContextMenuItem};
+use crate::app::{App, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::clawd::{clawd_lines, ClawdPose};
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
@@ -588,6 +588,17 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
 
     // Restrict selection to message pane area only
     let msg_area = app.last_msg_area.get();
+
+    // Validate selection is within message area bounds
+    if anchor.0 < msg_area.x
+        || anchor.0 >= msg_area.x.saturating_add(msg_area.width)
+        || anchor.1 < msg_area.y
+        || anchor.1 >= msg_area.y.saturating_add(msg_area.height)
+    {
+        // Anchor is outside message area — clear selection
+        return;
+    }
+
     let msg_max_row = msg_area.y.saturating_add(msg_area.height).saturating_sub(1);
     let msg_max_col = msg_area.x.saturating_add(msg_area.width).saturating_sub(1);
 
@@ -640,17 +651,21 @@ fn render_context_menu(frame: &mut Frame, app: &App) {
     if let Some(menu) = app.context_menu_state {
         let items = [
             ("Copy", !app.selection_text.borrow().is_empty()),
+            ("Copy as MD", !app.messages.is_empty()),
+            ("Copy Plain", !app.messages.is_empty()),
+            ("Copy Code", !app.messages.is_empty()),
+            ("Copy JSON", !app.messages.is_empty()),
             ("Paste", true),
             ("Cut", !app.selection_text.borrow().is_empty()),
             ("Select All", true),
             ("Clear", app.selection_anchor.is_some()),
         ];
 
-        let menu_height = (items.len() as u16).min(10); // Limit to 10 items max
-        let menu_width = 15; // Fixed width for context menu
+        let menu_height = (items.len() as u16).min(15); // Limit to 15 items max
+        let menu_width = 16; // Increased width for longer labels
 
         // Clamp menu position to screen bounds
-        let screen = frame.size();
+        let screen = frame.area();
         let menu_x = menu.x.min(screen.width.saturating_sub(menu_width + 1));
         let menu_y = menu.y.min(screen.height.saturating_sub(menu_height + 1));
 
@@ -709,7 +724,7 @@ fn render_context_menu(frame: &mut Frame, app: &App) {
                     break;
                 }
                 if let Some(cell) = frame.buffer_mut().cell_mut((inner.x + col_offset as u16, y)) {
-                    cell.set_symbol(ch.to_string());
+                    cell.set_symbol(&ch.to_string());
                     cell.set_style(style);
                 }
             }
@@ -828,6 +843,10 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     list.sticky_bottom = app.auto_scroll;
     list.set_items(lines);
     list.scroll_offset = scroll as u16;
+
+    // Track scroll offset for selection validation
+    app.last_render_scroll_offset.set(scroll as u16);
+
     list.render(msg_area, frame.buffer_mut());
 
     // "â†“ N new messages" indicator when scrolled up and new messages arrived.
