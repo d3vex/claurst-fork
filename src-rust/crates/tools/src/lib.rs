@@ -1,13 +1,13 @@
-// cc-tools: All tool implementations for the Claude Code Rust port.
+// claurst-tools: All tool implementations for Claurst.
 //
 // Each tool maps to a capability the LLM can invoke: running shell commands,
 // reading/writing/editing files, searching codebases, fetching web pages, etc.
 
 use async_trait::async_trait;
-use cc_core::config::PermissionMode;
-use cc_core::cost::CostTracker;
-use cc_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
-use cc_core::types::ToolDefinition;
+use claurst_core::config::PermissionMode;
+use claurst_core::cost::CostTracker;
+use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
+use claurst_core::types::ToolDefinition;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,11 +17,14 @@ use std::sync::Arc;
 // Sub-modules – each contains a full tool implementation.
 pub mod ask_user;
 pub mod bash;
+pub mod pty_bash;
 pub mod brief;
 pub mod config_tool;
 pub mod cron;
 pub mod enter_plan_mode;
 pub mod exit_plan_mode;
+pub mod apply_patch;
+pub mod batch_edit;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -47,15 +50,20 @@ pub mod repl_tool;
 pub mod synthetic_output;
 pub mod team_tool;
 pub mod remote_trigger;
+pub mod formatter;
 
 // Re-exports for convenience.
+pub use formatter::try_format_file;
 pub use ask_user::AskUserQuestionTool;
 pub use bash::BashTool;
+pub use pty_bash::PtyBashTool;
 pub use brief::BriefTool;
 pub use config_tool::ConfigTool;
 pub use cron::{CronCreateTool, CronDeleteTool, CronListTool};
 pub use enter_plan_mode::EnterPlanModeTool;
 pub use exit_plan_mode::ExitPlanModeTool;
+pub use apply_patch::ApplyPatchTool;
+pub use batch_edit::BatchEditTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -69,7 +77,7 @@ pub use powershell::PowerShellTool;
 pub use send_message::{SendMessageTool, drain_inbox, peek_inbox};
 pub use skill_tool::SkillTool;
 pub use sleep::SleepTool;
-pub use tasks::{TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool};
+pub use tasks::{TaskCreateTool, TaskGetTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskUpdateTool, Task, TaskStatus, TASK_STORE};
 pub use tool_search::ToolSearchTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
@@ -78,7 +86,7 @@ pub use computer_use::ComputerUseTool;
 pub use mcp_auth_tool::McpAuthTool;
 pub use repl_tool::ReplTool;
 pub use synthetic_output::SyntheticOutputTool;
-pub use team_tool::{TeamCreateTool, TeamDeleteTool};
+pub use team_tool::{TeamCreateTool, TeamDeleteTool, register_agent_runner, AgentRunFn};
 pub use remote_trigger::RemoteTriggerTool;
 
 // ---------------------------------------------------------------------------
@@ -165,6 +173,11 @@ impl ShellState {
 static SHELL_STATE_REGISTRY: once_cell::sync::Lazy<dashmap::DashMap<String, Arc<parking_lot::Mutex<ShellState>>>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
+/// Process-global registry of `SnapshotManager` instances keyed by session_id.
+/// Used by tools to record pre-write snapshots and by `/undo` to revert them.
+static SNAPSHOT_REGISTRY: once_cell::sync::Lazy<dashmap::DashMap<String, Arc<parking_lot::Mutex<claurst_core::SnapshotManager>>>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
 /// Return the persistent `ShellState` for the given session, creating one if needed.
 pub fn session_shell_state(session_id: &str) -> Arc<parking_lot::Mutex<ShellState>> {
     SHELL_STATE_REGISTRY
@@ -178,6 +191,19 @@ pub fn clear_session_shell_state(session_id: &str) {
     SHELL_STATE_REGISTRY.remove(session_id);
 }
 
+/// Return the persistent `SnapshotManager` for the given session, creating one if needed.
+pub fn session_snapshot(session_id: &str) -> Arc<parking_lot::Mutex<claurst_core::SnapshotManager>> {
+    SNAPSHOT_REGISTRY
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(parking_lot::Mutex::new(claurst_core::SnapshotManager::new())))
+        .clone()
+}
+
+/// Remove the snapshot manager for a session (e.g. when the session ends).
+pub fn clear_session_snapshot(session_id: &str) {
+    SNAPSHOT_REGISTRY.remove(session_id);
+}
+
 /// Shared context passed to every tool invocation.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -186,14 +212,14 @@ pub struct ToolContext {
     pub permission_handler: Arc<dyn PermissionHandler>,
     pub cost_tracker: Arc<CostTracker>,
     pub session_id: String,
-    pub file_history: Arc<parking_lot::Mutex<cc_core::file_history::FileHistory>>,
+    pub file_history: Arc<parking_lot::Mutex<claurst_core::file_history::FileHistory>>,
     pub current_turn: Arc<AtomicUsize>,
     /// If true, suppress interactive prompts (batch / CI mode).
     pub non_interactive: bool,
     /// Optional MCP manager for ListMcpResources / ReadMcpResource tools.
-    pub mcp_manager: Option<Arc<cc_mcp::McpManager>>,
+    pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Configured event hooks (PreToolUse, PostToolUse, etc.).
-    pub config: cc_core::config::Config,
+    pub config: claurst_core::config::Config,
 }
 
 impl ToolContext {
@@ -213,19 +239,49 @@ impl ToolContext {
         tool_name: &str,
         description: &str,
         is_read_only: bool,
-    ) -> Result<(), cc_core::error::ClaudeError> {
+    ) -> Result<(), claurst_core::error::ClaudeError> {
         let request = PermissionRequest {
             tool_name: tool_name.to_string(),
             description: description.to_string(),
             details: None,
             is_read_only,
+            context_description: None,
         };
         let decision = self.permission_handler.request_permission(&request);
         match decision {
             PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
-            _ => Err(cc_core::error::ClaudeError::PermissionDenied(format!(
+            _ => Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
                 "Permission denied for tool '{}'",
                 tool_name
+            ))),
+        }
+    }
+
+    /// Like `check_permission` but also passes structured `details` text
+    /// (e.g. a risk explanation) that the TUI permission dialog can display.
+    ///
+    /// Used by PowerShellTool (and any future tool) when it needs to show
+    /// the user *why* a command is considered risky before they approve it.
+    pub fn check_permission_with_details(
+        &self,
+        tool_name: &str,
+        description: &str,
+        details: &str,
+        is_read_only: bool,
+    ) -> Result<(), claurst_core::error::ClaudeError> {
+        let request = PermissionRequest {
+            tool_name: tool_name.to_string(),
+            description: description.to_string(),
+            details: Some(details.to_string()),
+            is_read_only,
+            context_description: None,
+        };
+        let decision = self.permission_handler.request_permission(&request);
+        match decision {
+            PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
+            _ => Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
+                "Permission denied for tool '{}': {}",
+                tool_name, details
             ))),
         }
     }
@@ -254,7 +310,7 @@ impl ToolContext {
 /// The trait every tool must implement.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Human-readable name (matches the constant in cc_core::constants).
+    /// Human-readable name (matches the constant in claurst_core::constants).
     fn name(&self) -> &str;
 
     /// One-line description shown to the LLM.
@@ -282,10 +338,12 @@ pub trait Tool: Send + Sync {
 /// Return all built-in tools (excluding AgentTool, which lives in cc-query).
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(BashTool),
+        Box::new(PtyBashTool),
         Box::new(FileReadTool),
         Box::new(FileEditTool),
         Box::new(FileWriteTool),
+        Box::new(BatchEditTool),
+        Box::new(ApplyPatchTool),
         Box::new(GlobTool),
         Box::new(GrepTool),
         Box::new(WebFetchTool),
@@ -455,20 +513,20 @@ mod tests {
 
     #[test]
     fn test_resolve_path_absolute() {
-        use cc_core::config::Config;
-        use cc_core::permissions::AutoPermissionHandler;
+        use claurst_core::config::Config;
+        use claurst_core::permissions::AutoPermissionHandler;
 
         let handler = Arc::new(AutoPermissionHandler {
-            mode: cc_core::config::PermissionMode::Default,
+            mode: claurst_core::config::PermissionMode::Default,
         });
         let ctx = ToolContext {
             working_dir: PathBuf::from("/workspace"),
-            permission_mode: cc_core::config::PermissionMode::Default,
+            permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: handler,
-            cost_tracker: cc_core::cost::CostTracker::new(),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
             session_id: "test".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
-                cc_core::file_history::FileHistory::new(),
+                claurst_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
@@ -483,20 +541,20 @@ mod tests {
 
     #[test]
     fn test_resolve_path_relative() {
-        use cc_core::config::Config;
-        use cc_core::permissions::AutoPermissionHandler;
+        use claurst_core::config::Config;
+        use claurst_core::permissions::AutoPermissionHandler;
 
         let handler = Arc::new(AutoPermissionHandler {
-            mode: cc_core::config::PermissionMode::Default,
+            mode: claurst_core::config::PermissionMode::Default,
         });
         let ctx = ToolContext {
             working_dir: PathBuf::from("/workspace"),
-            permission_mode: cc_core::config::PermissionMode::Default,
+            permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: handler,
-            cost_tracker: cc_core::cost::CostTracker::new(),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
             session_id: "test".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
-                cc_core::file_history::FileHistory::new(),
+                claurst_core::file_history::FileHistory::new(),
             )),
             current_turn: Arc::new(AtomicUsize::new(0)),
             non_interactive: true,
@@ -521,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_bash_tool_permission_level() {
-        assert_eq!(BashTool.permission_level(), PermissionLevel::Execute);
+        assert_eq!(PtyBashTool.permission_level(), PermissionLevel::Execute);
     }
 
     #[test]
@@ -543,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_tool_to_definition() {
-        let def = BashTool.to_definition();
+        let def = PtyBashTool.to_definition();
         assert_eq!(def.name, "Bash");
         assert!(!def.description.is_empty());
         assert!(def.input_schema.is_object());

@@ -17,7 +17,7 @@ struct FileWriteInput {
 #[async_trait]
 impl Tool for FileWriteTool {
     fn name(&self) -> &str {
-        cc_core::constants::TOOL_NAME_FILE_WRITE
+        claurst_core::constants::TOOL_NAME_FILE_WRITE
     }
 
     fn description(&self) -> &str {
@@ -110,6 +110,9 @@ impl Tool for FileWriteTool {
             params.content.as_bytes(),
             self.name(),
         );
+
+        // Run any configured formatter for this file type.
+        crate::try_format_file(&path.to_string_lossy(), ctx).await;
 
         let line_count = params.content.lines().count();
         let byte_count = params.content.len();

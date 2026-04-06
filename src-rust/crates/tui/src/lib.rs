@@ -1,4 +1,4 @@
-// cc-tui: Terminal UI using ratatui + crossterm for the Claude Code Rust port.
+// claurst-tui: Terminal UI using ratatui + crossterm for Claurst.
 //
 // This crate provides the interactive terminal interface including:
 // - Message display with syntax highlighting
@@ -27,14 +27,16 @@ use std::io::{self, Stdout};
 
 /// Figure/icon constants matching src/constants/figures.ts
 pub mod figures;
-/// Clawd robot mascot rendering.
-pub mod clawd;
+/// Rustle mascot rendering.
+pub mod rustle;
 /// Context window and rate-limit visualization overlay (/context).
 pub mod context_viz;
 /// Export format picker dialog (/export).
 pub mod export_dialog;
 /// Clipboard image paste and Ctrl+V text paste.
 pub mod image_paste;
+/// Inline image rendering via the Kitty graphics protocol (with text fallback).
+pub mod kitty_image;
 /// Application state and main event loop.
 pub mod app;
 /// Input helpers: slash command parsing.
@@ -55,6 +57,8 @@ pub mod plugin_views;
 pub mod settings_screen;
 /// Theme picker overlay.
 pub mod theme_screen;
+/// Color palette management for different themes and accessibility support.
+pub mod theme_colors;
 /// Privacy settings dialog.
 pub mod privacy_screen;
 /// Diff viewer dialog (two-pane: file list + unified diff detail).
@@ -63,6 +67,8 @@ pub mod diff_viewer;
 pub mod virtual_list;
 /// Message type renderers (assistant, user, tool use, etc.).
 pub mod messages;
+/// Turn-aware transcript grouping and metadata helpers.
+pub mod transcript_turn;
 /// Agent definitions list and coordinator progress view.
 pub mod agents_view;
 /// Stats dialog with token usage and cost charts.
@@ -73,7 +79,7 @@ pub mod mcp_view;
 pub mod prompt_input;
 /// Session quality feedback survey overlay.
 pub mod feedback_survey;
-/// Memory file selector overlay (CLAUDE.md browser).
+/// Memory file selector overlay (AGENTS.md browser).
 pub mod memory_file_selector;
 /// Read-only hooks configuration browser.
 pub mod hooks_config_menu;
@@ -81,9 +87,11 @@ pub mod hooks_config_menu;
 pub mod overage_upsell;
 /// Voice mode availability notice (shown when voice is available but not enabled).
 pub mod voice_mode_notice;
+/// Message copy utilities for different formatting options (markdown, plaintext, code, JSON).
+pub mod message_copy;
 /// Desktop app upsell startup dialog (shown at startup on macOS/Windows x64).
 pub mod desktop_upsell_startup;
-/// Memory update notification banner (shown after Claude updates a CLAUDE.md file).
+/// Memory update notification banner (shown after Claurst updates a AGENTS.md file).
 pub mod memory_update_notification;
 /// MCP elicitation dialog (form-based user input requested by MCP servers).
 pub mod elicitation_dialog;
@@ -91,18 +99,31 @@ pub mod elicitation_dialog;
 pub mod model_picker;
 /// Session browser overlay (/session, /resume, /rename, /export).
 pub mod session_browser;
-/// Startup dialog for malformed settings.json or CLAUDE.md.
+/// Startup dialog for malformed settings.json or AGENTS.md.
 pub mod invalid_config_dialog;
 /// Startup confirmation dialog for --dangerously-skip-permissions mode.
 pub mod bypass_permissions_dialog;
 /// First-launch onboarding / welcome dialog.
 pub mod onboarding_dialog;
+/// Reusable fuzzy-search selection dialog widget.
+pub mod dialog_select;
+/// Masked text input overlay for entering API keys.
+pub mod key_input_dialog;
+/// Device code / browser-based auth overlay (GitHub Copilot, Anthropic OAuth).
+pub mod device_auth_dialog;
+/// Push-to-talk voice capture and Whisper transcription.
+pub mod voice_capture;
+/// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
+pub mod tasks_overlay;
+/// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
+pub mod session_branching;
 
 // ---------------------------------------------------------------------------
 // Public re-exports
 // ---------------------------------------------------------------------------
 
-pub use app::App;
+pub use app::{App, try_copy_to_clipboard};
+pub use notifications::NotificationKind;
 pub use input::{is_slash_command, parse_slash_command};
 pub use feedback_survey::{FeedbackSurveyState, FeedbackSurveyStage, FeedbackResponse};
 pub use memory_file_selector::{MemoryFileSelectorState, MemoryFile, MemoryFileType};
@@ -119,19 +140,51 @@ pub use mcp_view::{McpViewState, McpServerView, McpToolView, McpViewStatus, rend
 pub use prompt_input::{PromptInputState, VimMode, VimPendingState, VimOperator, VimFindKind, InputMode, render_prompt_input, handle_paste, compute_typeahead};
 pub use model_picker::{ModelPickerState, ModelEntry, EffortLevel, render_model_picker, model_supports_effort};
 pub use session_browser::{SessionBrowserState, SessionBrowserMode, SessionEntry, render_session_browser};
+pub use session_branching::{SessionBranchingState, BranchBrowserMode, BranchInfo, render_session_branching};
 pub use invalid_config_dialog::{InvalidConfigDialogState, InvalidConfigKind, render_invalid_config_dialog};
 pub use bypass_permissions_dialog::{BypassPermissionsDialogState, render_bypass_permissions_dialog};
 pub use onboarding_dialog::{OnboardingDialogState, render_onboarding_dialog};
+pub use dialog_select::{DialogSelectState, SelectItem, render_dialog_select};
+pub use key_input_dialog::{KeyInputDialogState, render_key_input_dialog};
+pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuthEvent, render_device_auth_dialog};
 
 // ---------------------------------------------------------------------------
 // Terminal initialization / teardown helpers (public API)
 // ---------------------------------------------------------------------------
 
-/// Set up the terminal for TUI mode (raw mode + alternate screen).
+/// Set up the terminal for TUI mode (raw mode + alternate screen + mouse capture).
+///
+/// Also installs a panic hook that restores the terminal before printing the
+/// panic message.  Without this, any panic in rendering code leaves the
+/// terminal in raw mode with mouse capture enabled — the user sees garbage
+/// input until they run `reset`.
 pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    // Chain on top of any existing hook (e.g. from a previous call or test harness).
+    // Only restore the terminal when the panic originates on the main thread.
+    // Tokio worker threads also trigger this process-wide hook (Tokio catches
+    // the panic internally but the hook still fires), so without this guard any
+    // panicking background task would destroy the live TUI display while the
+    // main render loop is still running.
+    let main_thread_id = std::thread::current().id();
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        if std::thread::current().id() == main_thread_id {
+            // Best-effort restore — ignore errors, we're already unwinding.
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                LeaveAlternateScreen,
+                DisableMouseCapture,
+                crossterm::cursor::Show,
+            );
+        }
+        original_hook(panic_info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    set_terminal_title("\u{1f980} Claurst");
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -140,9 +193,28 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// Restore the terminal to its original state.
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
+    // Restore the original title by clearing it (terminals fall back to default).
+    let _ = execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::SetTitle(""),
+    );
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Set the terminal window title via OSC escape sequence.
+pub fn set_terminal_title(title: &str) {
+    let _ = execute!(io::stdout(), crossterm::terminal::SetTitle(title));
+}
+
+/// Update the terminal title to reflect the current session context.
+/// Format: "🦀 | <topic>" or just "🦀 Claurst" when no topic is set.
+pub fn update_terminal_title(topic: Option<&str>) {
+    match topic {
+        Some(t) if !t.is_empty() => set_terminal_title(&format!("\u{1f980} | {}", t)),
+        _ => set_terminal_title("\u{1f980} Claurst"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,10 +225,10 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
 mod tests {
     use super::*;
     use app::{App, HistorySearch, ToolStatus, ToolUseBlock};
-    use cc_core::config::Config;
-    use cc_core::cost::CostTracker;
-    use cc_core::file_history::FileHistory;
-    use cc_core::types::{ContentBlock, Role, ToolResultContent};
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use claurst_core::file_history::FileHistory;
+    use claurst_core::types::{ContentBlock, Role, ToolResultContent};
     use dialogs::PermissionRequest;
     use notifications::NotificationKind;
     use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
@@ -285,7 +357,7 @@ mod tests {
 
         app.handle_key_event(ctrl(KeyCode::Char('s')));
 
-        let saved = temp.path().join(".claude").join("agents").join("planner.md");
+        let saved = temp.path().join(".claurst").join("agents").join("planner.md");
         assert!(saved.exists());
         let content = std::fs::read_to_string(saved).unwrap();
         assert!(content.contains("name: Planner"));
@@ -490,7 +562,7 @@ mod tests {
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = make_app();
-        app.push_message(cc_core::types::Message::user("hello".to_string()));
+        app.push_message(claurst_core::types::Message::user("hello".to_string()));
 
         terminal
             .draw(|frame| crate::render::render_app(frame, &app))
@@ -505,7 +577,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        assert!(rendered.contains("Claude Code"));
+        assert!(rendered.contains("Claurst"));
         assert!(rendered.contains("hello"));
     }
 
@@ -606,7 +678,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        assert!(!rendered.contains("? for shortcuts"));
+        assert!(!rendered.contains("? shortcuts"));
     }
 
     #[test]
@@ -723,7 +795,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<Vec<_>>()
             .join("");
-        assert!(rendered.contains("No turn changes available yet."));
+        assert!(rendered.contains("No changes were captured for this turn."));
     }
 
     #[test]
@@ -834,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_message_renderer_includes_tool_use_and_thinking_blocks() {
-        let msg = cc_core::types::Message::assistant_blocks(vec![
+        let msg = claurst_core::types::Message::assistant_blocks(vec![
             ContentBlock::Thinking {
                 thinking: "reasoning".to_string(),
                 signature: "sig".to_string(),
@@ -863,7 +935,7 @@ mod tests {
 
     #[test]
     fn test_message_renderer_includes_tool_result_errors() {
-        let msg = cc_core::types::Message::user_blocks(vec![ContentBlock::ToolResult {
+        let msg = claurst_core::types::Message::user_blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "toolu_1".to_string(),
             content: ToolResultContent::Text("boom".to_string()),
             is_error: Some(true),
@@ -885,7 +957,7 @@ mod tests {
     #[test]
     fn test_handle_status_event() {
         let mut app = make_app();
-        app.handle_query_event(cc_query::QueryEvent::Status("working".to_string()));
+        app.handle_query_event(claurst_query::QueryEvent::Status("working".to_string()));
         assert_eq!(app.status_message.as_deref(), Some("working"));
     }
 
@@ -893,7 +965,7 @@ mod tests {
     fn test_handle_error_event() {
         let mut app = make_app();
         app.is_streaming = true;
-        app.handle_query_event(cc_query::QueryEvent::Error("oops".to_string()));
+        app.handle_query_event(claurst_query::QueryEvent::Error("oops".to_string()));
         assert!(!app.is_streaming);
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].get_all_text().contains("oops"));
@@ -902,15 +974,16 @@ mod tests {
     #[test]
     fn test_handle_tool_start_and_end() {
         let mut app = make_app();
-        app.handle_query_event(cc_query::QueryEvent::ToolStart {
+        app.handle_query_event(claurst_query::QueryEvent::ToolStart {
             tool_name: "Bash".to_string(),
             tool_id: "t1".to_string(),
             input_json: r#"{"command":"ls -la"}"#.to_string(),
         });
         assert_eq!(app.tool_use_blocks.len(), 1);
+        assert_eq!(app.tool_use_blocks[0].turn_index, None);
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Running);
 
-        app.handle_query_event(cc_query::QueryEvent::ToolEnd {
+        app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
             tool_name: "Bash".to_string(),
             tool_id: "t1".to_string(),
             result: "output".to_string(),
@@ -925,11 +998,12 @@ mod tests {
         app.tool_use_blocks.push(ToolUseBlock {
             id: "t2".to_string(),
             name: "Read".to_string(),
+            turn_index: None,
             status: ToolStatus::Running,
             output_preview: None,
             input_json: r#"{"file_path":"foo.rs"}"#.to_string(),
         });
-        app.handle_query_event(cc_query::QueryEvent::ToolEnd {
+        app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
             tool_name: "Read".to_string(),
             tool_id: "t2".to_string(),
             result: "file not found".to_string(),
@@ -944,7 +1018,7 @@ mod tests {
         let mut app = make_app();
         app.is_streaming = true;
         app.streaming_text = "partial response".to_string();
-        app.handle_query_event(cc_query::QueryEvent::TurnComplete {
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
             turn: 1,
             stop_reason: "end_turn".to_string(),
             usage: None,
@@ -953,6 +1027,49 @@ mod tests {
         assert!(app.streaming_text.is_empty());
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].get_all_text(), "partial response");
+    }
+
+    #[test]
+    fn test_turn_complete_flushes_streaming_thinking_into_blocks() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.streaming_thinking = "outline the fix".to_string();
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+
+        let blocks = app.messages[0].content_blocks();
+        assert!(matches!(
+            blocks.first(),
+            Some(ContentBlock::Thinking { thinking, .. }) if thinking == "outline the fix"
+        ));
+    }
+
+    #[test]
+    fn test_render_app_transcript_uses_turn_metadata_without_legacy_glyph() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.push_message(claurst_core::types::Message::user("hello".to_string()));
+        app.push_message(claurst_core::types::Message::assistant("hi there".to_string()));
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(!rendered.contains("◆"));
+        assert!(rendered.contains("▣"));
     }
 
     // ---- HistorySearch --------------------------------------------------

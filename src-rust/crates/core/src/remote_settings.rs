@@ -3,7 +3,7 @@
 // Port of src/services/remoteManagedSettings/index.ts
 //
 // Fetches enterprise-managed settings from Anthropic's API, caches them to
-// ~/.claude/remote-settings.json, and polls every hour in the background.
+// ~/.claurst/remote-settings.json, and polls every hour in the background.
 // Fails open — if the fetch fails, the app continues without remote settings.
 //
 // Eligibility:
@@ -29,6 +29,17 @@ const SETTINGS_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MAX_RETRIES: u32 = 5;
 /// 1-hour polling interval (matches TypeScript POLLING_INTERVAL_MS)
 pub const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+// ---------------------------------------------------------------------------
+// Free-code stub: no remote settings fetching
+// ---------------------------------------------------------------------------
+
+/// Stub: Returns empty managed settings.
+/// The free/OSS build does not fetch server-pushed security overlays or
+/// enterprise-managed settings from Anthropic's API.
+pub async fn fetch_remote_managed_settings() -> Value {
+    serde_json::json!({})
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -58,7 +69,7 @@ impl Default for RemoteSettingsConfig {
     }
 }
 
-/// On-disk cache structure stored in ~/.claude/remote-settings.json.
+/// On-disk cache structure stored in ~/.claurst/remote-settings.json.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RemoteSettingsCache {
     /// The cached settings object (may be empty `{}`).
@@ -394,11 +405,11 @@ pub fn merge_remote_into_local(local: &Value, remote: &Value) -> Value {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Return the ~/.claude directory, falling back to the current directory.
+/// Return the ~/.claurst directory, falling back to the current directory.
 fn claude_config_dir() -> PathBuf {
     dirs::home_dir()
-        .map(|h| h.join(".claude"))
-        .unwrap_or_else(|| PathBuf::from(".claude"))
+        .map(|h| h.join(".claurst"))
+        .unwrap_or_else(|| PathBuf::from(".claurst"))
 }
 
 /// Exponential backoff delay for retry attempt `n` (1-indexed).

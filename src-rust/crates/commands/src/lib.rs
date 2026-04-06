@@ -1,13 +1,13 @@
-// cc-commands: Slash command system for the Claude Code Rust port.
+// claurst-commands: Slash command system for Claurst.
 //
 // This crate implements the /command framework that allows users to type
 // commands like /help, /compact, /clear, /model, /config, /cost, etc.
 // Each command is a struct implementing the `SlashCommand` trait.
 
 use async_trait::async_trait;
-use cc_core::config::{Config, Settings, Theme};
-use cc_core::cost::CostTracker;
-use cc_core::types::Message;
+use claurst_core::config::{Config, Settings, Theme};
+use claurst_core::cost::CostTracker;
+use claurst_core::types::Message;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 #[allow(unused_imports)]
@@ -29,7 +29,7 @@ pub struct CommandContext {
     pub remote_session_url: Option<String>,
     // Note: config already contains hooks, mcp_servers, etc.
     /// Live MCP manager — present when servers are connected.
-    pub mcp_manager: Option<Arc<cc_mcp::McpManager>>,
+    pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
 }
 
 /// Result of running a slash command.
@@ -48,7 +48,7 @@ pub enum CommandResult {
     /// Replace the conversation with a specific message list (used by /rewind).
     SetMessages(Vec<Message>),
     /// Load a previously saved session into the live REPL.
-    ResumeSession(cc_core::history::ConversationSession),
+    ResumeSession(claurst_core::history::ConversationSession),
     /// Update the current session title.
     RenameSession(String),
     /// Trigger the OAuth login flow (handled by the REPL in main.rs).
@@ -63,6 +63,15 @@ pub enum CommandResult {
     /// Open the rewind/message-selector overlay in the TUI.
     /// The TUI will call SetMessages when the user confirms.
     OpenRewindOverlay,
+    /// Open the hooks configuration browser overlay in the TUI.
+    /// Falls back to a text listing in non-TUI contexts.
+    OpenHooksOverlay,
+    /// Clear saved provider auth, model selection, and model caches, then
+    /// rebuild the live runtime state.
+    RefreshProviderState,
+    /// Activate a speech mode (caveman/rocky) with level, or deactivate (normal).
+    /// (mode, level) — mode=None means deactivate.
+    SpeechMode { mode: Option<String>, level: String },
 }
 
 /// Every slash command implements this trait.
@@ -110,6 +119,10 @@ pub struct UsageCommand;
 pub struct DoctorCommand;
 pub struct LoginCommand;
 pub struct LogoutCommand;
+pub struct RefreshCommand;
+pub struct CavemanCommand;
+pub struct RockyCommand;
+pub struct NormalCommand;
 pub struct InitCommand;
 pub struct ReviewCommand;
 pub struct HooksCommand;
@@ -166,6 +179,12 @@ pub struct InsightsCommand;
 pub struct UltrareviewCommand;
 pub struct AdvisorCommand;
 pub struct InstallSlackAppCommand;
+pub struct UndoCommand;
+pub struct ProvidersCommand;
+pub struct ConnectCommand;
+pub struct AgentCommand;
+pub struct SearchCommand;
+pub struct ForkCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -234,7 +253,7 @@ fn open_with_system(target: &str) -> std::io::Result<()> {
     }
 }
 
-fn format_keystroke(keystroke: &cc_core::keybindings::ParsedKeystroke) -> String {
+fn format_keystroke(keystroke: &claurst_core::keybindings::ParsedKeystroke) -> String {
     let mut parts = Vec::new();
     if keystroke.ctrl {
         parts.push("ctrl".to_string());
@@ -255,7 +274,7 @@ fn format_keystroke(keystroke: &cc_core::keybindings::ParsedKeystroke) -> String
     parts.join("+")
 }
 
-fn format_chord(chord: &[cc_core::keybindings::ParsedKeystroke]) -> String {
+fn format_chord(chord: &[claurst_core::keybindings::ParsedKeystroke]) -> String {
     chord
         .iter()
         .map(format_keystroke)
@@ -265,9 +284,9 @@ fn format_chord(chord: &[cc_core::keybindings::ParsedKeystroke]) -> String {
 
 fn generate_keybindings_template() -> anyhow::Result<String> {
     let mut grouped: BTreeMap<String, BTreeMap<String, Option<String>>> = BTreeMap::new();
-    for binding in cc_core::keybindings::default_bindings() {
+    for binding in claurst_core::keybindings::default_bindings() {
         let chord = format_chord(&binding.chord);
-        if cc_core::keybindings::NON_REBINDABLE.contains(&chord.as_str()) {
+        if claurst_core::keybindings::NON_REBINDABLE.contains(&chord.as_str()) {
             continue;
         }
         grouped
@@ -306,7 +325,7 @@ fn current_output_style_name(config: &Config) -> &str {
 }
 
 fn available_output_style_names() -> Vec<String> {
-    cc_core::output_styles::all_styles(&Settings::config_dir())
+    claurst_core::output_styles::all_styles(&Settings::config_dir())
         .into_iter()
         .map(|style| style.name)
         .collect()
@@ -367,16 +386,16 @@ fn execute_named_command_from_slash(
 /// Category labels for help grouping.
 fn command_category(name: &str) -> &'static str {
     match name {
-        "clear" | "compact" | "rewind" | "summary" | "export" | "rename" | "branch" => {
+        "clear" | "compact" | "rewind" | "summary" | "export" | "rename" | "branch" | "fork" => {
             "Conversation"
         }
         "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort"
         | "voice" | "statusline" | "output-style" | "keybindings"
         | "privacy-settings" | "rate-limit-options" | "sandbox-toggle" => "Settings",
         "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
-        "status" | "doctor" | "terminal-setup" | "version" | "upgrade"
+        "status" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade"
         | "release-notes" => "System",
-        "login" | "logout" | "permissions" => "Auth & Permissions",
+        "login" | "logout" | "refresh" | "permissions" => "Auth & Permissions",
         "memory" | "files" | "diff" | "init" | "commit" | "review"
         | "security-review" => "Project",
         "mcp" | "hooks" | "ide" | "chrome" => "Integrations",
@@ -460,7 +479,7 @@ impl SlashCommand for HelpCommand {
                 .push(format!("  /{:<20} {}", format!("{}{}", cmd.name(), alias_str), cmd.description()));
         }
 
-        let mut output = String::from("Claude Code — Slash Commands\n");
+        let mut output = String::from("Claurst — Slash Commands\n");
         output.push_str("════════════════════════════\n");
 
         for cat in &category_order {
@@ -521,19 +540,77 @@ impl SlashCommand for CompactCommand {
 impl SlashCommand for CostCommand {
     fn name(&self) -> &str { "cost" }
     fn description(&self) -> &str { "Show token usage and cost for this session" }
+    fn help(&self) -> &str {
+        "Usage: /cost\n\n\
+         Shows per-category token counts and the estimated cost for this session.\n\
+         Cache write tokens are priced slightly higher than input; cache read tokens\n\
+         are ~10x cheaper — caching reduces cost significantly in long sessions.\n\
+         For per-call breakdown use /extra-usage. For account quotas use /usage."
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let tracker = &ctx.cost_tracker;
+        let model = ctx.config.effective_model();
+        let pricing = claurst_core::cost::ModelPricing::for_model(model);
+
+        let input = tracker.input_tokens();
+        let output = tracker.output_tokens();
+        let cache_create = tracker.cache_creation_tokens();
+        let cache_read = tracker.cache_read_tokens();
+        let total = tracker.total_tokens();
+        let cost = tracker.total_cost_usd();
+
+        // Per-category cost breakdown.
+        let input_cost    = (input as f64 * pricing.input_per_mtk) / 1_000_000.0;
+        let output_cost   = (output as f64 * pricing.output_per_mtk) / 1_000_000.0;
+        let cc_cost       = (cache_create as f64 * pricing.cache_creation_per_mtk) / 1_000_000.0;
+        let cr_cost       = (cache_read as f64 * pricing.cache_read_per_mtk) / 1_000_000.0;
+
+        // Pricing info line.
+        let pricing_line = format!(
+            "  Rates ($/MTok): input ${:.2} | output ${:.2} | cache-write ${:.3} | cache-read ${:.3}",
+            pricing.input_per_mtk,
+            pricing.output_per_mtk,
+            pricing.cache_creation_per_mtk,
+            pricing.cache_read_per_mtk,
+        );
+
+        // Cache savings note: how much input cost was avoided by using cache-read
+        // instead of re-sending those tokens as normal input.
+        let savings = if cache_read > 0 {
+            let saved =
+                (cache_read as f64 * (pricing.input_per_mtk - pricing.cache_read_per_mtk))
+                    / 1_000_000.0;
+            format!("\n  Cache savings:  ${:.4}  ({} tokens served from cache)", saved, cache_read)
+        } else {
+            String::new()
+        };
+
         CommandResult::Message(format!(
-            "Session cost:\n  Input tokens:  {}\n  Output tokens: {}\n  \
-             Cache creation: {}\n  Cache read:    {}\n  Total tokens:  {}\n  \
-             Estimated cost: ${:.4}",
-            tracker.input_tokens(),
-            tracker.output_tokens(),
-            tracker.cache_creation_tokens(),
-            tracker.cache_read_tokens(),
-            tracker.total_tokens(),
-            tracker.total_cost_usd(),
+            "Session Cost — {model}\n\
+             ──────────────────────────────\n\
+             {pricing_line}\n\n\
+               Input tokens:   {input:>10}   ${input_cost:.4}\n\
+               Output tokens:  {output:>10}   ${output_cost:.4}\n\
+               Cache write:    {cache_create:>10}   ${cc_cost:.4}\n\
+               Cache read:     {cache_read:>10}   ${cr_cost:.4}\n\
+             ─────────────────────────────\n\
+               Total tokens:   {total:>10}\n\
+               Total cost:              ${cost:.4}{savings}\n\n\
+             Use /usage for quota info · /extra-usage for per-call breakdown",
+            model = model,
+            pricing_line = pricing_line,
+            input = input,
+            input_cost = input_cost,
+            output = output,
+            output_cost = output_cost,
+            cache_create = cache_create,
+            cc_cost = cc_cost,
+            cache_read = cache_read,
+            cr_cost = cr_cost,
+            total = total,
+            cost = cost,
+            savings = savings,
         ))
     }
 }
@@ -544,7 +621,7 @@ impl SlashCommand for CostCommand {
 impl SlashCommand for ExitCommand {
     fn name(&self) -> &str { "exit" }
     fn aliases(&self) -> Vec<&str> { vec!["quit", "q"] }
-    fn description(&self) -> &str { "Exit Claude Code" }
+    fn description(&self) -> &str { "Exit Claurst" }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::Exit
@@ -557,17 +634,43 @@ impl SlashCommand for ExitCommand {
 impl SlashCommand for ModelCommand {
     fn name(&self) -> &str { "model" }
     fn description(&self) -> &str { "Show or change the current model" }
+    fn help(&self) -> &str {
+        "Usage: /model [<model-id>]\n\n\
+         Without arguments, shows the current model.\n\n\
+         With a model ID, switches to that model.  Accepts both bare model\n\
+         names (e.g. claude-sonnet-4-6) and provider-prefixed format\n\
+         (e.g. openai/gpt-4o, google/gemini-2.0-flash).\n\n\
+         Examples:\n\
+           /model                        — show current model\n\
+           /model claude-opus-4-6        — switch to Claude Opus 4.6\n\
+           /model openai/gpt-4o          — switch to GPT-4o via OpenAI\n\
+           /model google/gemini-2.0-flash — switch to Gemini 2.0 Flash"
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let args = args.trim();
         if args.is_empty() {
             CommandResult::Message(format!(
                 "Current model: {}",
                 ctx.config.effective_model()
             ))
         } else {
+            // Accept both "provider/model" and bare model names.
+            // The config stores the full string (including provider prefix when present)
+            // so that downstream dispatch can route to the correct provider.
+            let model_str = args.to_string();
+            let confirmation = if let Some((provider, model)) = model_str.split_once('/') {
+                if provider == "anthropic" {
+                    format!("Switched to {}", model)
+                } else {
+                    format!("Switched to {}/{}", provider, model)
+                }
+            } else {
+                format!("Switched to {}", model_str)
+            };
             let mut new_config = ctx.config.clone();
-            new_config.model = Some(args.trim().to_string());
-            CommandResult::ConfigChange(new_config)
+            new_config.model = Some(model_str);
+            CommandResult::ConfigChangeMessage(new_config, confirmation)
         }
     }
 }
@@ -716,14 +819,14 @@ impl SlashCommand for ConfigCommand {
             }
             "permission-mode" | "permission_mode" => {
                 let mode = match value.trim().to_lowercase().as_str() {
-                    "default" => cc_core::config::PermissionMode::Default,
+                    "default" => claurst_core::config::PermissionMode::Default,
                     "accept-edits" | "accept_edits" => {
-                        cc_core::config::PermissionMode::AcceptEdits
+                        claurst_core::config::PermissionMode::AcceptEdits
                     }
                     "bypass-permissions" | "bypass_permissions" => {
-                        cc_core::config::PermissionMode::BypassPermissions
+                        claurst_core::config::PermissionMode::BypassPermissions
                     }
-                    "plan" => cc_core::config::PermissionMode::Plan,
+                    "plan" => claurst_core::config::PermissionMode::Plan,
                     _ => {
                         return CommandResult::Error(
                             "Permission mode must be one of: default, accept-edits, bypass-permissions, plan"
@@ -761,7 +864,7 @@ impl SlashCommand for ColorCommand {
          Named colors: red, green, blue, yellow, cyan, magenta, white, orange, purple\n\
          Hex codes:    #RGB or #RRGGBB\n\
          Reset:        /color default\n\n\
-         The color is persisted to ~/.claude/ui-settings.json and\n\
+         The color is persisted to ~/.claurst/ui-settings.json and\n\
          applied on the next REPL startup."
     }
 
@@ -910,7 +1013,7 @@ impl SlashCommand for OutputStyleCommand {
 #[async_trait]
 impl SlashCommand for KeybindingsCommand {
     fn name(&self) -> &str { "keybindings" }
-    fn description(&self) -> &str { "Create or open ~/.claude/keybindings.json" }
+    fn description(&self) -> &str { "Create or open ~/.claurst/keybindings.json" }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let config_dir = Settings::config_dir();
@@ -976,7 +1079,7 @@ impl SlashCommand for KeybindingsCommand {
 #[async_trait]
 impl SlashCommand for PrivacySettingsCommand {
     fn name(&self) -> &str { "privacy-settings" }
-    fn description(&self) -> &str { "Open Claude privacy settings" }
+    fn description(&self) -> &str { "Open Claurst privacy settings" }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let url = "https://claude.ai/settings/data-privacy-controls";
@@ -998,8 +1101,8 @@ impl SlashCommand for VersionCommand {
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::Message(format!(
-            "Claude Code (Rust) v{}",
-            cc_core::constants::APP_VERSION
+            "Claurst v{}",
+            claurst_core::constants::APP_VERSION
         ))
     }
 }
@@ -1014,7 +1117,7 @@ impl SlashCommand for ResumeCommand {
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         if args.is_empty() {
-            let sessions = cc_core::history::list_sessions().await;
+            let sessions = claurst_core::history::list_sessions().await;
             if sessions.is_empty() {
                 return CommandResult::Message("No previous sessions found.".to_string());
             }
@@ -1036,7 +1139,7 @@ impl SlashCommand for ResumeCommand {
             output.push_str("\nUse /resume <id> to resume a session.");
             CommandResult::Message(output)
         } else {
-            match cc_core::history::load_session(args.trim()).await {
+            match claurst_core::history::load_session(args.trim()).await {
                 Ok(session) => CommandResult::ResumeSession(session),
                 Err(e) => CommandResult::Error(format!(
                     "Failed to load session {}: {}",
@@ -1057,7 +1160,7 @@ impl SlashCommand for StatusCommand {
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         // Auth status
-        let auth_status = match cc_core::oauth::OAuthTokens::load().await {
+        let auth_status = match claurst_core::oauth::OAuthTokens::load().await {
             Some(tokens) => {
                 let sub = tokens.subscription_type.as_deref().unwrap_or("oauth");
                 format!("Authenticated ({})", sub)
@@ -1097,7 +1200,7 @@ impl SlashCommand for StatusCommand {
             .unwrap_or_else(|_| "n/a".to_string());
 
         CommandResult::Message(format!(
-            "Claude Code Status\n\
+            "Claurst Status\n\
              ══════════════════\n\
              Auth:           {auth_status}\n\
              Model:          {model}\n\
@@ -1212,55 +1315,135 @@ impl SlashCommand for DiffCommand {
 #[async_trait]
 impl SlashCommand for MemoryCommand {
     fn name(&self) -> &str { "memory" }
-    fn description(&self) -> &str { "View CLAUDE.md memory files (project and global)" }
+    fn description(&self) -> &str { "View, edit, or clear AGENTS.md memory files" }
     fn help(&self) -> &str {
-        "Usage: /memory [edit]\n\n\
-         Shows the content of CLAUDE.md files that provide project context to Claude.\n\
-         Claude reads these files automatically at session start.\n\n\
+        "Usage: /memory [edit|clear] [global]\n\n\
+         Shows the content of AGENTS.md files that provide project context to Claurst.\n\
+         Claurst reads these files automatically at session start.\n\n\
+         Subcommands:\n\
+           /memory              — show all AGENTS.md files\n\
+           /memory edit         — open project AGENTS.md in your editor\n\
+           /memory edit global  — open global ~/.claurst/AGENTS.md in your editor\n\
+           /memory clear        — clear the project AGENTS.md\n\
+           /memory clear global — clear the global ~/.claurst/AGENTS.md\n\n\
          Locations checked (in priority order):\n\
-         1. <project>/.claude/CLAUDE.md\n\
-         2. <project>/CLAUDE.md\n\
-         3. ~/.claude/CLAUDE.md  (global memory)\n\n\
-         Use /memory edit to open the project CLAUDE.md in your editor.\n\
-         Use /init to create a new CLAUDE.md from a template."
+           1. <project>/.claurst/AGENTS.md\n\
+           2. <project>/AGENTS.md\n\
+           3. ~/.claurst/AGENTS.md  (global)\n\n\
+         Use /init to create a new AGENTS.md from a template."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let project_claude_dir = ctx.working_dir.join(".claude").join("CLAUDE.md");
-        let project_root = ctx.working_dir.join("CLAUDE.md");
+        let project_claude_dir = ctx.working_dir.join(".claurst").join("AGENTS.md");
+        let project_root = ctx.working_dir.join("AGENTS.md");
         let global_path = dirs::home_dir()
             .unwrap_or_default()
-            .join(".claude")
-            .join("CLAUDE.md");
+            .join(".claurst")
+            .join("AGENTS.md");
 
         let locations = [
-            ("project (.claude/CLAUDE.md)", project_claude_dir.clone()),
-            ("project (CLAUDE.md)", project_root.clone()),
-            ("global (~/.claude/CLAUDE.md)", global_path.clone()),
+            ("project (.claurst/AGENTS.md)", project_claude_dir.clone()),
+            ("project (AGENTS.md)", project_root.clone()),
+            ("global (~/.claurst/AGENTS.md)", global_path.clone()),
         ];
 
-        let edit_mode = args.trim() == "edit";
+        let cmd = args.trim();
 
-        if edit_mode {
-            // Open best available CLAUDE.md
-            let target = if project_root.exists() {
-                project_root.clone()
-            } else if project_claude_dir.exists() {
-                project_claude_dir.clone()
-            } else {
-                project_root.clone() // will be created by editor
+        // ---- /memory edit [global|project] ------------------------------------
+        if cmd == "edit" || cmd.starts_with("edit ") {
+            let target_hint = cmd.strip_prefix("edit").map(|s| s.trim()).unwrap_or("project");
+            let target = match target_hint {
+                "global" => {
+                    // Ensure global dir exists
+                    if let Some(parent) = global_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    global_path.clone()
+                }
+                _ => {
+                    // Best project AGENTS.md
+                    if project_root.exists() {
+                        project_root.clone()
+                    } else if project_claude_dir.exists() {
+                        project_claude_dir.clone()
+                    } else {
+                        project_root.clone() // will be created by editor
+                    }
+                }
             };
-            return match open_with_system(&target.display().to_string()) {
+            // Create file if it doesn't exist yet
+            if !target.exists() {
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&target, "");
+            }
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| {
+                    if cfg!(target_os = "windows") {
+                        "notepad".to_string()
+                    } else {
+                        "vi".to_string()
+                    }
+                });
+            let editor_hint = if let Ok(visual) = std::env::var("VISUAL") {
+                format!("Using $VISUAL=\"{}\".", visual)
+            } else if let Ok(ed) = std::env::var("EDITOR") {
+                format!("Using $EDITOR=\"{}\".", ed)
+            } else {
+                "To use a different editor, set the $EDITOR or $VISUAL environment variable.".to_string()
+            };
+            let spawn_result = std::process::Command::new(&editor)
+                .arg(&target)
+                .status();
+            return match spawn_result {
                 Ok(_) => CommandResult::Message(format!(
-                    "Opening {} in your editor.", target.display()
+                    "Opened {} in your editor.\n{}",
+                    target.display(),
+                    editor_hint
                 )),
                 Err(e) => CommandResult::Message(format!(
-                    "Could not launch editor: {}. Edit {} manually.", e, target.display()
+                    "Could not launch '{}': {}. Edit {} manually.\n{}",
+                    editor, e, target.display(), editor_hint
                 )),
             };
         }
 
-        let mut output = String::from("CLAUDE.md Memory Files\n══════════════════════\n");
+        // ---- /memory clear [global|project] -----------------------------------
+        if cmd == "clear" || cmd.starts_with("clear ") {
+            let target_hint = cmd.strip_prefix("clear").map(|s| s.trim()).unwrap_or("project");
+            let (label, target) = match target_hint {
+                "global" => ("global (~/.claurst/AGENTS.md)", global_path.clone()),
+                _ => {
+                    if project_claude_dir.exists() {
+                        ("project (.claurst/AGENTS.md)", project_claude_dir.clone())
+                    } else {
+                        ("project (AGENTS.md)", project_root.clone())
+                    }
+                }
+            };
+            if !target.exists() {
+                return CommandResult::Message(format!(
+                    "No {} memory file found (nothing to clear).",
+                    label
+                ));
+            }
+            return match tokio::fs::write(&target, "").await {
+                Ok(_) => CommandResult::Message(format!(
+                    "Cleared {} memory file at {}.\n\
+                     Claurst will no longer see this content at session start.",
+                    label,
+                    target.display()
+                )),
+                Err(e) => CommandResult::Error(format!(
+                    "Failed to clear {}: {}", target.display(), e
+                )),
+            };
+        }
+
+        // ---- /memory (show all) -----------------------------------------------
+        let mut output = String::from("AGENTS.md Memory Files\n══════════════════════\n");
         let mut found_any = false;
 
         for (label, path) in &locations {
@@ -1295,11 +1478,18 @@ impl SlashCommand for MemoryCommand {
 
         if !found_any {
             output.push_str(
-                "\nNo CLAUDE.md files found.\n\
-                 Use /init to create one in the current project."
+                "\nNo AGENTS.md files found.\n\
+                 Use /init to create one in the current project.\n\
+                 Use /memory edit to create and open a memory file."
             );
         } else {
-            output.push_str("\nUse /memory edit to open the project CLAUDE.md.");
+            output.push_str(
+                "\nSubcommands:\n\
+                 /memory edit          — edit project AGENTS.md\n\
+                 /memory edit global   — edit global ~/.claurst/AGENTS.md\n\
+                 /memory clear         — clear project AGENTS.md\n\
+                 /memory clear global  — clear global AGENTS.md"
+            );
         }
 
         CommandResult::Message(output)
@@ -1312,7 +1502,7 @@ impl SlashCommand for MemoryCommand {
 impl SlashCommand for BugCommand {
     fn name(&self) -> &str { "feedback" }
     fn aliases(&self) -> Vec<&str> { vec!["bug"] }
-    fn description(&self) -> &str { "Submit feedback about Claude Code" }
+    fn description(&self) -> &str { "Submit feedback about Claurst" }
     fn help(&self) -> &str { "Usage: /feedback [report]" }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -1353,7 +1543,7 @@ impl SlashCommand for UsageCommand {
         let cost = ctx.cost_tracker.total_cost_usd();
 
         // Try to get account tier from OAuth tokens
-        let account_info = match cc_core::oauth::OAuthTokens::load().await {
+        let account_info = match claurst_core::oauth::OAuthTokens::load().await {
             Some(tokens) => {
                 let sub = tokens.subscription_type.as_deref().unwrap_or("unknown");
                 format!("Plan: {}", sub)
@@ -1402,7 +1592,7 @@ impl SlashCommand for PluginCommand {
     fn description(&self) -> &str { "Manage plugins" }
     fn help(&self) -> &str {
         "Usage: /plugin [list|info <name>|enable <name>|disable <name>|install <path>|reload]\n\
-         Manage Claude Code plugins.\n\n\
+         Manage Claurst plugins.\n\n\
          Subcommands:\n\
            /plugin              — list all installed plugins\n\
            /plugin list         — list all installed plugins\n\
@@ -1420,31 +1610,31 @@ impl SlashCommand for PluginCommand {
         // fresh disk scan so the command still works without the global being set.
         async fn get_registry(
             project_dir: &std::path::Path,
-        ) -> cc_plugins::PluginRegistry {
-            if let Some(global) = cc_plugins::global_plugin_registry() {
-                let mut reg = cc_plugins::PluginRegistry::new();
+        ) -> claurst_plugins::PluginRegistry {
+            if let Some(global) = claurst_plugins::global_plugin_registry() {
+                let mut reg = claurst_plugins::PluginRegistry::new();
                 for p in global.all() {
                     reg.insert(p.clone());
                 }
                 reg
             } else {
-                cc_plugins::load_plugins(project_dir, &[]).await
+                claurst_plugins::load_plugins(project_dir, &[]).await
             }
         }
 
-        let parsed = cc_plugins::parse_plugin_args(args);
+        let parsed = claurst_plugins::parse_plugin_args(args);
         match parsed {
-            cc_plugins::PluginSubCommand::List => {
+            claurst_plugins::PluginSubCommand::List => {
                 let registry = get_registry(&project_dir).await;
-                CommandResult::Message(cc_plugins::format_plugin_list(&registry))
+                CommandResult::Message(claurst_plugins::format_plugin_list(&registry))
             }
-            cc_plugins::PluginSubCommand::Enable(ref name) if name.is_empty() => {
+            claurst_plugins::PluginSubCommand::Enable(ref name) if name.is_empty() => {
                 CommandResult::Error(
                     "Usage: /plugin enable <name>\nRun /plugin list to see installed plugins."
                         .to_string(),
                 )
             }
-            cc_plugins::PluginSubCommand::Enable(name) => {
+            claurst_plugins::PluginSubCommand::Enable(name) => {
                 let registry = get_registry(&project_dir).await;
                 if registry.get(&name).is_none() {
                     return CommandResult::Error(format!(
@@ -1452,7 +1642,7 @@ impl SlashCommand for PluginCommand {
                         name
                     ));
                 }
-                let mut settings = cc_core::config::Settings::load_sync().unwrap_or_default();
+                let mut settings = claurst_core::config::Settings::load_sync().unwrap_or_default();
                 settings.enabled_plugins.insert(name.clone());
                 settings.disabled_plugins.remove(&name);
                 let _ = settings.save_sync();
@@ -1461,13 +1651,13 @@ impl SlashCommand for PluginCommand {
                     name
                 ))
             }
-            cc_plugins::PluginSubCommand::Disable(ref name) if name.is_empty() => {
+            claurst_plugins::PluginSubCommand::Disable(ref name) if name.is_empty() => {
                 CommandResult::Error(
                     "Usage: /plugin disable <name>\nRun /plugin list to see installed plugins."
                         .to_string(),
                 )
             }
-            cc_plugins::PluginSubCommand::Disable(name) => {
+            claurst_plugins::PluginSubCommand::Disable(name) => {
                 let registry = get_registry(&project_dir).await;
                 if registry.get(&name).is_none() {
                     return CommandResult::Error(format!(
@@ -1475,7 +1665,7 @@ impl SlashCommand for PluginCommand {
                         name
                     ));
                 }
-                let mut settings = cc_core::config::Settings::load_sync().unwrap_or_default();
+                let mut settings = claurst_core::config::Settings::load_sync().unwrap_or_default();
                 settings.disabled_plugins.insert(name.clone());
                 settings.enabled_plugins.remove(&name);
                 let _ = settings.save_sync();
@@ -1484,24 +1674,24 @@ impl SlashCommand for PluginCommand {
                     name
                 ))
             }
-            cc_plugins::PluginSubCommand::Info(ref name) if name.is_empty() => {
+            claurst_plugins::PluginSubCommand::Info(ref name) if name.is_empty() => {
                 CommandResult::Error(
                     "Usage: /plugin info <name>\nRun /plugin list to see installed plugins."
                         .to_string(),
                 )
             }
-            cc_plugins::PluginSubCommand::Info(name) => {
+            claurst_plugins::PluginSubCommand::Info(name) => {
                 let registry = get_registry(&project_dir).await;
-                CommandResult::Message(cc_plugins::format_plugin_info(&registry, &name))
+                CommandResult::Message(claurst_plugins::format_plugin_info(&registry, &name))
             }
-            cc_plugins::PluginSubCommand::Install(ref path) if path.is_empty() => {
+            claurst_plugins::PluginSubCommand::Install(ref path) if path.is_empty() => {
                 CommandResult::Error(
                     "Usage: /plugin install <path>\nProvide the path to a local plugin directory."
                         .to_string(),
                 )
             }
-            cc_plugins::PluginSubCommand::Install(path) => {
-                let result = cc_plugins::install_plugin_from_path(
+            claurst_plugins::PluginSubCommand::Install(path) => {
+                let result = claurst_plugins::install_plugin_from_path(
                     std::path::Path::new(&path),
                 );
                 match result {
@@ -1512,13 +1702,13 @@ impl SlashCommand for PluginCommand {
                     Err(e) => CommandResult::Error(format!("Install failed: {}", e)),
                 }
             }
-            cc_plugins::PluginSubCommand::Reload => {
+            claurst_plugins::PluginSubCommand::Reload => {
                 let old_registry = get_registry(&project_dir).await;
                 let (new_registry, diff) =
-                    cc_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
-                CommandResult::Message(cc_plugins::format_reload_summary(&new_registry, &diff))
+                    claurst_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
+                CommandResult::Message(claurst_plugins::format_reload_summary(&new_registry, &diff))
             }
-            cc_plugins::PluginSubCommand::Help => {
+            claurst_plugins::PluginSubCommand::Help => {
                 CommandResult::Message(
                     "Plugin commands:\n\
                      /plugin              — list all installed plugins\n\
@@ -1549,11 +1739,11 @@ impl SlashCommand for ReloadPluginsCommand {
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let project_dir = ctx.working_dir.clone();
 
-        let old_registry = cc_plugins::load_plugins(&project_dir, &[]).await;
+        let old_registry = claurst_plugins::load_plugins(&project_dir, &[]).await;
         let (new_registry, diff) =
-            cc_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
+            claurst_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
 
-        CommandResult::Message(cc_plugins::format_reload_summary(&new_registry, &diff))
+        CommandResult::Message(claurst_plugins::format_reload_summary(&new_registry, &diff))
     }
 }
 
@@ -1563,7 +1753,7 @@ impl SlashCommand for ReloadPluginsCommand {
 /// built-in slash command.  The adapter is created on-the-fly inside
 /// `execute_command` when no built-in matches the input.
 pub struct PluginSlashCommandAdapter {
-    pub def: cc_plugins::PluginCommandDef,
+    pub def: claurst_plugins::PluginCommandDef,
 }
 
 #[async_trait]
@@ -1577,11 +1767,16 @@ impl SlashCommand for PluginSlashCommandAdapter {
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        // Enforce capability grants before the action runs.
+        if let Err(reason) = claurst_plugins::check_plugin_capability(&self.def) {
+            return CommandResult::Error(reason);
+        }
+
         match &self.def.run_action {
-            cc_plugins::CommandRunAction::StaticResponse(msg) => {
+            claurst_plugins::CommandRunAction::StaticResponse(msg) => {
                 CommandResult::Message(msg.clone())
             }
-            cc_plugins::CommandRunAction::MarkdownPrompt {
+            claurst_plugins::CommandRunAction::MarkdownPrompt {
                 file_path,
                 plugin_root: _,
             } => {
@@ -1601,7 +1796,7 @@ impl SlashCommand for PluginSlashCommandAdapter {
                     )),
                 }
             }
-            cc_plugins::CommandRunAction::ShellCommand {
+            claurst_plugins::CommandRunAction::ShellCommand {
                 command,
                 plugin_root,
             } => {
@@ -1641,29 +1836,73 @@ impl SlashCommand for PluginSlashCommandAdapter {
 impl SlashCommand for DoctorCommand {
     fn name(&self) -> &str { "doctor" }
     fn description(&self) -> &str { "Check system health and diagnose issues" }
+    fn help(&self) -> &str {
+        "Usage: /doctor\n\
+         Runs a comprehensive system diagnostics check:\n\
+         - API key validation (live GET /v1/models call)\n\
+         - Git availability\n\
+         - MCP server connection status\n\
+         - Disk space\n\
+         - Config file integrity\n\
+         - Tool permission summary\n\
+         - Claurst version"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let mut lines: Vec<String> = Vec::new();
 
         // ── Header ─────────────────────────────────────────────────────────
         lines.push(format!(
-            "Claude Code v{}  |  {}",
-            cc_core::constants::APP_VERSION,
+            "Claurst v{}  |  {}",
+            env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
         ));
         lines.push(String::new());
 
         // ── API / Auth ──────────────────────────────────────────────────────
         lines.push("Authentication".to_string());
-        if ctx.config.resolve_api_key().is_some() {
-            lines.push("  ✓ API key configured".to_string());
-        } else {
-            // Check for OAuth token as fallback
-            let oauth_path = cc_core::config::Settings::config_dir().join("credentials.json");
-            if oauth_path.exists() {
-                lines.push("  ✓ OAuth credentials found".to_string());
-            } else {
-                lines.push("  ✗ No API key found — set ANTHROPIC_API_KEY or run /login".to_string());
+        // Try a real live call to GET /v1/models to validate the key.
+        let auth = ctx.config.resolve_auth_async().await;
+        match auth {
+            Some((credential, use_bearer)) => {
+                let base_url = ctx.config.resolve_api_base();
+                let models_url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+                let http = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(8))
+                    .build()
+                    .unwrap_or_default();
+                let req = if use_bearer {
+                    http.get(&models_url)
+                        .header("Authorization", format!("Bearer {}", credential))
+                        .header("anthropic-version", "2023-06-01")
+                } else {
+                    http.get(&models_url)
+                        .header("x-api-key", &credential)
+                        .header("anthropic-version", "2023-06-01")
+                };
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        lines.push("  ✓ API key valid (GET /v1/models returned 200)".to_string());
+                    }
+                    Ok(resp) if resp.status() == 401 || resp.status() == 403 => {
+                        lines.push(format!(
+                            "  ✗ API key rejected ({}) — check ANTHROPIC_API_KEY or run /login",
+                            resp.status()
+                        ));
+                    }
+                    Ok(resp) => {
+                        lines.push(format!(
+                            "  ⚠ API reachable but returned {} — key may still be valid",
+                            resp.status()
+                        ));
+                    }
+                    Err(e) => {
+                        lines.push(format!("  ⚠ Could not reach API: {}", e));
+                    }
+                }
+            }
+            None => {
+                lines.push("  ✗ No Anthropic API key found — set ANTHROPIC_API_KEY, run /login, or use a different provider".to_string());
             }
         }
         // Show which model is active
@@ -1703,37 +1942,97 @@ impl SlashCommand for DoctorCommand {
         }
         lines.push(String::new());
 
+        // ── Disk space ──────────────────────────────────────────────────────
+        lines.push("Disk Space".to_string());
+        #[cfg(windows)]
+        {
+            // On Windows use PowerShell to get free space for the current drive
+            let ps_out = tokio::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command",
+                    "Get-PSDrive -Name (Split-Path -Qualifier (Get-Location)) | \
+                     Select-Object Name,@{N='Used(GB)';E={[math]::Round($_.Used/1GB,1)}},\
+                     @{N='Free(GB)';E={[math]::Round($_.Free/1GB,1)}} | Format-Table -HideTableHeaders"])
+                .output()
+                .await;
+            match ps_out {
+                Ok(o) if o.status.success() => {
+                    let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if out.is_empty() {
+                        lines.push("  • Disk info unavailable".to_string());
+                    } else {
+                        for l in out.lines().take(3) {
+                            lines.push(format!("  • {}", l.trim()));
+                        }
+                    }
+                }
+                _ => lines.push("  ⚠ Could not query disk space".to_string()),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let df_out = tokio::process::Command::new("df")
+                .args(["-h", "."])
+                .output()
+                .await;
+            match df_out {
+                Ok(o) if o.status.success() => {
+                    let out = String::from_utf8_lossy(&o.stdout);
+                    // Print the header + the first data line (current filesystem)
+                    for (i, l) in out.lines().enumerate().take(2) {
+                        if i == 0 {
+                            lines.push(format!("  • {}", l));
+                        } else {
+                            lines.push(format!("  ✓ {}", l));
+                        }
+                    }
+                }
+                _ => lines.push("  ⚠ Could not query disk space (`df -h .` failed)".to_string()),
+            }
+        }
+        lines.push(String::new());
+
         // ── Config directory ────────────────────────────────────────────────
         lines.push("Configuration".to_string());
-        let config_dir = cc_core::config::Settings::config_dir();
+        let config_dir = claurst_core::config::Settings::config_dir();
         if config_dir.exists() {
             lines.push(format!("  ✓ Config dir: {}", config_dir.display()));
         } else {
             lines.push(format!("  ✗ Config dir missing: {}", config_dir.display()));
         }
 
-        // Settings validation
+        // Settings validation — try loading ~/.claurst/settings.json
         let settings_path = config_dir.join("settings.json");
         if settings_path.exists() {
             match std::fs::read_to_string(&settings_path)
                 .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|s| serde_json::from_str::<claurst_core::config::Settings>(&s).ok())
             {
-                Some(_) => lines.push("  ✓ settings.json valid JSON".to_string()),
-                None => lines.push("  ✗ settings.json is invalid — run /config to repair".to_string()),
+                Some(_) => lines.push("  ✓ settings.json valid".to_string()),
+                None => {
+                    // Try as raw JSON to distinguish missing vs invalid
+                    match std::fs::read_to_string(&settings_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    {
+                        Some(_) => lines.push(
+                            "  ⚠ settings.json is JSON but has unexpected structure".to_string()
+                        ),
+                        None => lines.push(
+                            "  ✗ settings.json is invalid JSON — run /config to repair".to_string()
+                        ),
+                    }
+                }
             }
         } else {
             lines.push("  • settings.json not found (defaults will be used)".to_string());
         }
 
-        // CLAUDE.md
-        let claude_md = std::env::current_dir()
-            .ok()
-            .map(|d| d.join("CLAUDE.md"));
-        if claude_md.as_deref().map(|p| p.exists()).unwrap_or(false) {
-            lines.push("  ✓ CLAUDE.md present in working directory".to_string());
+        // AGENTS.md
+        let claude_md = ctx.working_dir.join("AGENTS.md");
+        if claude_md.exists() {
+            lines.push("  ✓ AGENTS.md present in working directory".to_string());
         } else {
-            lines.push("  • No CLAUDE.md in working directory (run /init to create one)".to_string());
+            lines.push("  • No AGENTS.md in working directory (run /init to create one)".to_string());
         }
         lines.push(String::new());
 
@@ -1742,8 +2041,37 @@ impl SlashCommand for DoctorCommand {
         let mcp_count = ctx.config.mcp_servers.len();
         if mcp_count == 0 {
             lines.push("  • No MCP servers configured".to_string());
+        } else if let Some(mgr) = ctx.mcp_manager.as_ref() {
+            // Report live connection status from the manager
+            let statuses = mgr.all_statuses();
+            for srv in ctx.config.mcp_servers.iter().take(12) {
+                let status_str = match statuses.get(&srv.name) {
+                    Some(claurst_mcp::McpServerStatus::Connected { tool_count }) => {
+                        format!("  ✓ {} — connected ({} tool{})",
+                            srv.name, tool_count, if *tool_count == 1 { "" } else { "s" })
+                    }
+                    Some(claurst_mcp::McpServerStatus::Connecting) => {
+                        format!("  ⚠ {} — connecting…", srv.name)
+                    }
+                    Some(claurst_mcp::McpServerStatus::Disconnected { last_error: Some(e) }) => {
+                        format!("  ✗ {} — failed: {}", srv.name, e)
+                    }
+                    Some(claurst_mcp::McpServerStatus::Disconnected { last_error: None }) => {
+                        format!("  ✗ {} — disconnected", srv.name)
+                    }
+                    Some(claurst_mcp::McpServerStatus::Failed { error, .. }) => {
+                        format!("  ✗ {} — failed: {}", srv.name, error)
+                    }
+                    None => format!("  ⚠ {} — not started", srv.name),
+                };
+                lines.push(status_str);
+            }
+            if mcp_count > 12 {
+                lines.push(format!("    … and {} more", mcp_count - 12));
+            }
         } else {
-            lines.push(format!("  ✓ {mcp_count} MCP server(s) configured:"));
+            // No live manager — just show configured names
+            lines.push(format!("  ✓ {mcp_count} MCP server(s) configured (not yet connected):"));
             for srv in ctx.config.mcp_servers.iter().take(8) {
                 lines.push(format!("    - {}", srv.name));
             }
@@ -1764,6 +2092,46 @@ impl SlashCommand for DoctorCommand {
         }
         lines.push(String::new());
 
+        // ── Tool permissions ─────────────────────────────────────────────────
+        lines.push("Tool Permissions".to_string());
+        let all_tool_names: Vec<String> = claurst_tools::all_tools()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        let total_tools = all_tool_names.len();
+        let allowed_count = ctx.config.allowed_tools.len();
+        let denied_count = ctx.config.disallowed_tools.len();
+        // Tools not in allowed or denied lists require user confirmation
+        let explicit_tools: std::collections::HashSet<&str> = ctx.config.allowed_tools.iter()
+            .chain(ctx.config.disallowed_tools.iter())
+            .map(|s| s.as_str())
+            .collect();
+        let confirm_count = all_tool_names.iter()
+            .filter(|n| !explicit_tools.contains(n.as_str()))
+            .count();
+        let mode_label = match ctx.config.permission_mode {
+            claurst_core::PermissionMode::BypassPermissions => "bypass-permissions (no confirmation required)",
+            claurst_core::PermissionMode::AcceptEdits => "accept-edits (file edits auto-approved)",
+            claurst_core::PermissionMode::Plan => "plan (read-only, no writes)",
+            claurst_core::PermissionMode::Default => "default (confirm destructive actions)",
+        };
+        lines.push(format!("  • Mode: {mode_label}"));
+        lines.push(format!("  • Total built-in tools: {total_tools}"));
+        if allowed_count > 0 {
+            lines.push(format!("  ✓ Always allowed: {} tool(s) — {}",
+                allowed_count,
+                ctx.config.allowed_tools.join(", ")));
+        }
+        if denied_count > 0 {
+            lines.push(format!("  ✗ Always denied: {} tool(s) — {}",
+                denied_count,
+                ctx.config.disallowed_tools.join(", ")));
+        }
+        if ctx.config.permission_mode == claurst_core::PermissionMode::Default {
+            lines.push(format!("  ⚠ Require confirmation: {} tool(s)", confirm_count));
+        }
+        lines.push(String::new());
+
         // ── Session / lock ──────────────────────────────────────────────────
         lines.push("Session".to_string());
         let lock_path = config_dir.join("claude.lock");
@@ -1772,17 +2140,8 @@ impl SlashCommand for DoctorCommand {
         } else {
             lines.push("  ✓ No stale lock file".to_string());
         }
-
-        // Working directory
-        if let Ok(cwd) = std::env::current_dir() {
-            lines.push(format!("  • Working dir: {}", cwd.display()));
-        }
-        lines.push(String::new());
-
-        // ── Available tools ─────────────────────────────────────────────────
-        lines.push("Built-in Tools".to_string());
-        let tool_count = cc_tools::all_tools().len();
-        lines.push(format!("  ✓ {tool_count} built-in tools available"));
+        lines.push(format!("  • Session ID: {}", ctx.session_id));
+        lines.push(format!("  • Working dir: {}", ctx.working_dir.display()));
 
         CommandResult::Message(lines.join("\n"))
     }
@@ -1811,11 +2170,11 @@ impl SlashCommand for LogoutCommand {
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         // Clear OAuth tokens file
-        if let Err(e) = cc_core::oauth::OAuthTokens::clear().await {
+        if let Err(e) = claurst_core::oauth::OAuthTokens::clear().await {
             return CommandResult::Error(format!("Failed to clear OAuth tokens: {}", e));
         }
         // Also clear any API key stored in settings
-        let mut settings = cc_core::config::Settings::load().await.unwrap_or_default();
+        let mut settings = claurst_core::config::Settings::load().await.unwrap_or_default();
         settings.config.api_key = None;
         if let Err(e) = settings.save().await {
             return CommandResult::Error(format!("Failed to update settings: {}", e));
@@ -1825,18 +2184,101 @@ impl SlashCommand for LogoutCommand {
     }
 }
 
+// ---- /refresh ------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for RefreshCommand {
+    fn name(&self) -> &str { "refresh" }
+    fn description(&self) -> &str { "Clear saved provider auth and model caches" }
+    fn help(&self) -> &str {
+        "Usage: /refresh\n\n\
+         Clears saved provider credentials, provider/model selection, and model caches, then rebuilds the live runtime state.\n\
+         After refreshing, run /connect to authenticate and choose a provider again."
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        if !args.trim().is_empty() {
+            return CommandResult::Error("Usage: /refresh".to_string());
+        }
+        CommandResult::RefreshProviderState
+    }
+}
+
+// ---- /caveman, /rocky, /normal -------------------------------------------
+
+fn parse_speech_level(args: &str) -> String {
+    match args.trim().to_lowercase().as_str() {
+        "lite" | "light" => "lite".to_string(),
+        "ultra" | "heavy" => "ultra".to_string(),
+        "" | "full" | "moderate" | "default" => "full".to_string(),
+        other => {
+            // Unknown level, default to full
+            tracing::warn!(level = other, "Unknown speech level, using full");
+            "full".to_string()
+        }
+    }
+}
+
+#[async_trait]
+impl SlashCommand for CavemanCommand {
+    fn name(&self) -> &str { "caveman" }
+    fn description(&self) -> &str { "Caveman speech mode — why use many token when few token do trick" }
+    fn help(&self) -> &str {
+        "Usage: /caveman [lite|full|ultra]\n\n\
+         Activates caveman speech mode that cuts ~75% of output tokens.\n\
+         - lite:  Remove pleasantries and hedging only (~40% reduction)\n\
+         - full:  Drop articles, compress sentences (default, ~75% reduction)\n\
+         - ultra: Maximum compression, imperative phrases only (~85% reduction)\n\n\
+         Use /normal to deactivate."
+    }
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let level = parse_speech_level(args);
+        CommandResult::SpeechMode { mode: Some("caveman".to_string()), level }
+    }
+}
+
+#[async_trait]
+impl SlashCommand for RockyCommand {
+    fn name(&self) -> &str { "rocky" }
+    fn description(&self) -> &str { "Rocky speech mode — Eridian alien engineer from Project Hail Mary. Save big token. Good good good." }
+    fn help(&self) -> &str {
+        "Usage: /rocky [lite|full|ultra]\n\n\
+         Speak like Rocky from Project Hail Mary. Saves big token. Amaze amaze amaze.\n\
+         - lite:  Grammar rules only, minimal emphasis (~40% reduction)\n\
+         - full:  Full Rocky grammar + regular emphasis (default, ~75% reduction)\n\
+         - ultra: Maximum Rocky personality, frequent emphasis, alien observations\n\n\
+         Use /normal to deactivate."
+    }
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let level = parse_speech_level(args);
+        CommandResult::SpeechMode { mode: Some("rocky".to_string()), level }
+    }
+}
+
+#[async_trait]
+impl SlashCommand for NormalCommand {
+    fn name(&self) -> &str { "normal" }
+    fn description(&self) -> &str { "Deactivate speech mode (caveman/rocky)" }
+    fn help(&self) -> &str {
+        "Usage: /normal\n\nDeactivate any active speech mode and return to normal output."
+    }
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        CommandResult::SpeechMode { mode: None, level: "full".to_string() }
+    }
+}
+
 // ---- /init ---------------------------------------------------------------
 
 #[async_trait]
 impl SlashCommand for InitCommand {
     fn name(&self) -> &str { "init" }
-    fn description(&self) -> &str { "Initialize a new project with CLAUDE.md" }
+    fn description(&self) -> &str { "Initialize a new project with AGENTS.md" }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let path = ctx.working_dir.join("CLAUDE.md");
+        let path = ctx.working_dir.join("AGENTS.md");
         if path.exists() {
             return CommandResult::Message(format!(
-                "CLAUDE.md already exists at {}",
+                "AGENTS.md already exists at {}",
                 path.display()
             ));
         }
@@ -1850,10 +2292,10 @@ impl SlashCommand for InitCommand {
 
         match tokio::fs::write(&path, default_content).await {
             Ok(()) => CommandResult::Message(format!(
-                "Created CLAUDE.md at {}",
+                "Created AGENTS.md at {}",
                 path.display()
             )),
-            Err(e) => CommandResult::Error(format!("Failed to create CLAUDE.md: {}", e)),
+            Err(e) => CommandResult::Error(format!("Failed to create AGENTS.md: {}", e)),
         }
     }
 }
@@ -1863,16 +2305,338 @@ impl SlashCommand for InitCommand {
 #[async_trait]
 impl SlashCommand for ReviewCommand {
     fn name(&self) -> &str { "review" }
-    fn description(&self) -> &str { "Review code changes (git diff)" }
-
-    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let target = if args.is_empty() { "HEAD" } else { args.trim() };
-        CommandResult::UserMessage(format!(
-            "Please review the code changes in `git diff {}`. \
-             Look for bugs, security issues, and style problems.",
-            target
-        ))
+    fn description(&self) -> &str { "Review code changes via LLM and optionally post to GitHub PR" }
+    fn help(&self) -> &str {
+        "Usage: /review [base-ref]\n\n\
+         Runs `git diff <base>...HEAD` (or `git diff --cached` when no base is given),\n\
+         sends the diff to the LLM for a structured review, then optionally posts the\n\
+         review as a comment to the associated GitHub PR.\n\n\
+         GitHub posting requires:\n\
+           GITHUB_TOKEN  — a personal access token with repo scope\n\
+           CLAUDE_PR_NUMBER — the PR number (auto-detected from `git remote` if absent)\n\n\
+         Examples:\n\
+           /review            # diff of staged changes\n\
+           /review main       # diff from main..HEAD\n\
+           /review origin/main"
     }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let base = args.trim();
+
+        // ------------------------------------------------------------------
+        // 1. Collect the diff
+        // ------------------------------------------------------------------
+        let repo_root = claurst_core::git_utils::get_repo_root(&ctx.working_dir)
+            .unwrap_or_else(|| ctx.working_dir.clone());
+
+        let diff = if base.is_empty() {
+            // No base given — use staged changes; fall back to unstaged if empty.
+            let staged = claurst_core::git_utils::get_staged_diff(&repo_root);
+            if staged.is_empty() {
+                claurst_core::git_utils::get_unstaged_diff(&repo_root)
+            } else {
+                staged
+            }
+        } else {
+            // Run `git diff <base>...HEAD`
+            let out = std::process::Command::new("git")
+                .current_dir(&repo_root)
+                .args(["diff", &format!("{}...HEAD", base)])
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    return CommandResult::Error(format!(
+                        "git diff failed: {}",
+                        stderr.trim()
+                    ));
+                }
+                Err(e) => return CommandResult::Error(format!("Failed to run git: {}", e)),
+            }
+        };
+
+        if diff.is_empty() {
+            return CommandResult::Message(
+                "No diff found. Stage some changes or provide a base ref (e.g. /review main)."
+                    .to_string(),
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // 2. Summarise changed files for the TUI header
+        // ------------------------------------------------------------------
+        let changed_files: Vec<&str> = diff
+            .lines()
+            .filter(|l| l.starts_with("diff --git "))
+            .filter_map(|l| {
+                // "diff --git a/foo/bar.rs b/foo/bar.rs"  -> "foo/bar.rs"
+                let parts: Vec<&str> = l.split(' ').collect();
+                parts.get(3).map(|p| p.trim_start_matches("b/"))
+            })
+            .collect();
+
+        let file_summary = if changed_files.is_empty() {
+            "Changed files: (unknown)".to_string()
+        } else {
+            format!(
+                "Changed files ({}):\n{}",
+                changed_files.len(),
+                changed_files
+                    .iter()
+                    .map(|f| format!("  - {}", f))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+
+        // Truncate diff to a sensible size for the LLM (≈ 100 k chars).
+        const MAX_DIFF_CHARS: usize = 100_000;
+        let diff_for_llm = if diff.len() > MAX_DIFF_CHARS {
+            format!(
+                "{}\n\n[... diff truncated at {} chars ...]",
+                &diff[..MAX_DIFF_CHARS],
+                MAX_DIFF_CHARS
+            )
+        } else {
+            diff.clone()
+        };
+
+        // ------------------------------------------------------------------
+        // 3. Call the LLM for a structured PR review
+        // ------------------------------------------------------------------
+        let model = ctx.config.effective_model().to_string();
+
+        let api_client = match claurst_api::AnthropicClient::from_config(&ctx.config) {
+            Ok(c) => c,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Cannot initialise API client (no API key?): {}",
+                    e
+                ));
+            }
+        };
+
+        let review_prompt = format!(
+            "You are a senior software engineer performing a pull-request code review.\n\
+             Provide a concise, actionable review of the following diff.\n\n\
+             Structure your response as:\n\
+             ## Summary\n\
+             (1-3 sentences describing what changed)\n\n\
+             ## Issues\n\
+             (bulleted list: [CRITICAL|MAJOR|MINOR] file:line — description; \
+             omit section if none)\n\n\
+             ## Suggestions\n\
+             (bulleted list of optional improvements; omit section if none)\n\n\
+             ## Verdict\n\
+             APPROVE / REQUEST_CHANGES / COMMENT — one line with brief rationale\n\n\
+             ---\n\
+             {}\n\n\
+             ```diff\n\
+             {}\n\
+             ```",
+            file_summary, diff_for_llm
+        );
+
+        let request = claurst_api::CreateMessageRequest::builder(&model, 4096)
+            .messages(vec![claurst_api::ApiMessage {
+                role: "user".to_string(),
+                content: serde_json::Value::String(review_prompt),
+            }])
+            .system_text(
+                "You are a thorough, constructive code reviewer. \
+                 Be concise but precise. Focus on correctness, security, and maintainability.",
+            )
+            .build();
+
+        use std::sync::Arc;
+        let handler: Arc<dyn claurst_api::StreamHandler> =
+            Arc::new(claurst_api::streaming::NullStreamHandler);
+
+        let review_text = match api_client.create_message_stream(request, handler).await {
+            Err(e) => {
+                return CommandResult::Error(format!("LLM call failed: {}", e));
+            }
+            Ok(mut rx) => {
+                let mut acc = claurst_api::StreamAccumulator::new();
+                while let Some(evt) = rx.recv().await {
+                    acc.on_event(&evt);
+                    if matches!(evt, claurst_api::AnthropicStreamEvent::MessageStop) {
+                        break;
+                    }
+                }
+                let (msg, _usage, _stop) = acc.finish();
+                let text = msg.get_all_text();
+                if text.is_empty() {
+                    return CommandResult::Error(
+                        "LLM returned an empty review.".to_string(),
+                    );
+                }
+                text
+            }
+        };
+
+        // ------------------------------------------------------------------
+        // 4. Optionally post to GitHub PR
+        // ------------------------------------------------------------------
+        let github_token = std::env::var("GITHUB_TOKEN").ok();
+        let mut github_post_result: Option<String> = None;
+
+        if let Some(ref token) = github_token {
+            // Determine PR number
+            let pr_number: Option<u64> = std::env::var("CLAUDE_PR_NUMBER")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .or_else(|| detect_pr_number_from_git(&repo_root));
+
+            if let Some(pr_num) = pr_number {
+                // Determine owner/repo from git remote
+                if let Some((owner, repo)) = detect_github_owner_repo(&repo_root) {
+                    let comment_body = format!(
+                        "## Claurst Code Review\n\n{}\n\n---\n*Generated by [Claurst](https://claude.ai/claude-code)*",
+                        review_text
+                    );
+
+                    let url = format!(
+                        "https://api.github.com/repos/{}/{}/issues/{}/comments",
+                        owner, repo, pr_num
+                    );
+
+                    let http = reqwest::Client::new();
+                    let post_result = http
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {}", token))
+                        .header("User-Agent", "claurst/1.0")
+                        .header("Accept", "application/vnd.github+json")
+                        .json(&serde_json::json!({ "body": comment_body }))
+                        .send()
+                        .await;
+
+                    match post_result {
+                        Ok(resp) if resp.status().is_success() => {
+                            github_post_result = Some(format!(
+                                "\nPosted review comment to PR #{} ({}/{}).",
+                                pr_num, owner, repo
+                            ));
+                        }
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            let body = resp.text().await.unwrap_or_default();
+                            github_post_result = Some(format!(
+                                "\nGitHub API returned {}: {}",
+                                status, body
+                            ));
+                        }
+                        Err(e) => {
+                            github_post_result =
+                                Some(format!("\nFailed to post to GitHub: {}", e));
+                        }
+                    }
+                } else {
+                    github_post_result = Some(
+                        "\n(Could not detect GitHub owner/repo from git remote — \
+                         review not posted.)"
+                            .to_string(),
+                    );
+                }
+            } else {
+                github_post_result = Some(
+                    "\n(GITHUB_TOKEN set but no PR number found. \
+                     Set CLAUDE_PR_NUMBER=<n> to post the review.)"
+                        .to_string(),
+                );
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 5. Compose and return the final output
+        // ------------------------------------------------------------------
+        let mut output = format!("## Code Review\n\n{}\n\n{}", file_summary, review_text);
+
+        if let Some(ref note) = github_post_result {
+            output.push_str(note);
+        }
+
+        CommandResult::Message(output)
+    }
+}
+
+/// Try to detect the PR number from the GitHub API via `gh` CLI, then fall
+/// back to parsing the upstream tracking branch name (e.g. `pr/42/head`).
+fn detect_pr_number_from_git(repo_root: &std::path::Path) -> Option<u64> {
+    // Attempt `gh pr view --json number -q .number`
+    let out = std::process::Command::new("gh")
+        .current_dir(repo_root)
+        .args(["pr", "view", "--json", "number", "-q", ".number"])
+        .output()
+        .ok()?;
+
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout);
+        return s.trim().parse::<u64>().ok();
+    }
+
+    // Fallback: look at the upstream tracking ref for a pattern like
+    // `refs/pull/42/head` or branch name `pr/42`.
+    let tracking = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    // Pattern: "origin/pr/42" or "refs/pull/42/head"
+    for segment in tracking.split('/') {
+        if let Ok(n) = segment.parse::<u64>() {
+            return Some(n);
+        }
+    }
+
+    None
+}
+
+/// Parse `origin` remote URL to extract GitHub owner and repo name.
+/// Handles both HTTPS (`https://github.com/owner/repo.git`) and
+/// SSH (`git@github.com:owner/repo.git`) formats.
+fn detect_github_owner_repo(repo_root: &std::path::Path) -> Option<(String, String)> {
+    let remote_url = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+
+    parse_github_remote_url(&remote_url)
+}
+
+fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
+    // HTTPS: https://github.com/owner/repo.git  or  https://github.com/owner/repo
+    if let Some(rest) = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+    {
+        let clean = rest.trim_end_matches(".git");
+        let mut parts = clean.splitn(2, '/');
+        let owner = parts.next()?.to_string();
+        let repo = parts.next()?.to_string();
+        return Some((owner, repo));
+    }
+
+    // SSH: git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let clean = rest.trim_end_matches(".git");
+        let mut parts = clean.splitn(2, '/');
+        let owner = parts.next()?.to_string();
+        let repo = parts.next()?.to_string();
+        return Some((owner, repo));
+    }
+
+    None
 }
 
 // ---- /hooks --------------------------------------------------------------
@@ -1888,28 +2652,30 @@ impl SlashCommand for HooksCommand {
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        // In TUI mode this command is intercepted by intercept_slash_command("hooks")
+        // before execute() is ever called, so this path only runs in non-TUI
+        // contexts (e.g., `claude hooks` on the CLI, pipes, or tests).
+        //
+        // Signal to the CLI driver that it should open the TUI overlay if possible;
+        // the CLI will fall back to the text listing when no TUI is active.
         if ctx.config.hooks.is_empty() {
+            // If there is nothing to show in the overlay, emit a helpful message
+            // so the user knows what to do.
             return CommandResult::Message(
                 "No hooks configured.\n\
-                 Add hooks to ~/.claude/settings.json under the 'hooks' key.\n\
-                 Example:\n  \"hooks\": { \"PreToolUse\": [{\"command\": \"echo $STDIN\", \"blocking\": false}] }"
+                 Add hooks to ~/.claurst/settings.json under the 'hooks' key.\n\
+                 Example:\n\
+                 \x20 \"hooks\": {\n\
+                 \x20   \"PreToolUse\": [{ \"matcher\": \"*\", \"hooks\": [{ \"type\": \"command\", \"command\": \"echo $STDIN\" }] }]\n\
+                 \x20 }"
                     .to_string(),
             );
         }
 
-        let mut lines = vec!["Configured hooks:".to_string()];
-        for (event, entries) in &ctx.config.hooks {
-            lines.push(format!("\n  {:?} ({} entries):", event, entries.len()));
-            for e in entries {
-                let filter = e.tool_filter.as_deref().unwrap_or("*");
-                lines.push(format!(
-                    "    - [{}] {} (blocking={})",
-                    filter, e.command, e.blocking
-                ));
-            }
-        }
-
-        CommandResult::Message(lines.join("\n"))
+        // Return the overlay-open signal; the CLI driver will call
+        // app.hooks_config_menu.open() or fall back to text output if running
+        // without a TUI.
+        CommandResult::OpenHooksOverlay
     }
 }
 
@@ -1922,7 +2688,7 @@ impl SlashCommand for McpCommand {
     fn help(&self) -> &str {
         "Usage: /mcp [list|status|auth <server>|connect <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
          Manages Model Context Protocol (MCP) servers.\n\
-         MCP servers extend Claude with external tools, resources, and prompt templates.\n\n\
+         MCP servers extend Claurst with external tools, resources, and prompt templates.\n\n\
          Subcommands:\n\
            /mcp                        — list configured servers with live status\n\
            /mcp list                   — same as above\n\
@@ -1933,7 +2699,7 @@ impl SlashCommand for McpCommand {
            /mcp resources [server]     — list resources from connected servers\n\
            /mcp prompts [server]       — list prompt templates from connected servers\n\
            /mcp get-prompt <server> <prompt> [key=value ...]  — expand a prompt template\n\n\
-         To add/remove MCP servers, edit ~/.claude/settings.json\n\
+         To add/remove MCP servers, edit ~/.claurst/settings.json\n\
          under the 'mcpServers' key.\n\
          Docs: https://docs.anthropic.com/claude-code/mcp"
     }
@@ -1999,7 +2765,7 @@ impl SlashCommand for McpCommand {
         if ctx.config.mcp_servers.is_empty() {
             return CommandResult::Message(
                 "No MCP servers configured.\n\n\
-                 To add a MCP server, edit ~/.claude/settings.json:\n\
+                 To add a MCP server, edit ~/.claurst/settings.json:\n\
                  {\n\
                    \"mcpServers\": [\n\
                      {\n\
@@ -2047,7 +2813,7 @@ impl SlashCommand for McpCommand {
             if ctx.mcp_manager.is_none() {
                 output.push_str(
                     "\nNote: MCP manager is not active in this session.\n\
-                     Restart Claude Code to connect to MCP servers.\n\
+                     Restart Claurst to connect to MCP servers.\n\
                      Use /mcp connect <server> to retry a single server."
                 );
             }
@@ -2118,7 +2884,7 @@ impl McpCommand {
 
         // If already connected, nothing to do.
         if let Some(manager) = &ctx.mcp_manager {
-            use cc_mcp::McpServerStatus;
+            use claurst_mcp::McpServerStatus;
             match manager.server_status(server_name) {
                 McpServerStatus::Connected { tool_count } => {
                     return CommandResult::Message(format!(
@@ -2149,7 +2915,7 @@ impl McpCommand {
             } else {
                 format!("Configured env vars: {}", env_keys.join(", "))
             };
-            let token_note = match cc_mcp::oauth::get_mcp_token(server_name) {
+            let token_note = match claurst_mcp::oauth::get_mcp_token(server_name) {
                 Some(tok) if !tok.is_expired(60) => " (valid token stored)".to_string(),
                 Some(_) => " (stored token is expired)".to_string(),
                 None => " (no token stored)".to_string(),
@@ -2158,8 +2924,8 @@ impl McpCommand {
                 "MCP Server '{}' (stdio){}\n\
                  {}\n\n\
                  stdio servers authenticate via environment variables (API keys etc.).\n\
-                 Add required variables to the 'env' block in ~/.claude/settings.json,\n\
-                 then restart Claude Code or run /mcp connect {} to reconnect.",
+                 Add required variables to the 'env' block in ~/.claurst/settings.json,\n\
+                 then restart Claurst or run /mcp connect {} to reconnect.",
                 server_name, token_note, env_note, server_name
             ));
         }
@@ -2174,7 +2940,7 @@ impl McpCommand {
                         "MCP OAuth — '{}'\n\
                          Opening browser for authentication...\n\
                          If the browser did not open, visit:\n\n  {}\n\n\
-                         After authorizing, the token will be saved to:\n  ~/.claude/mcp-tokens/{}.json\n\n\
+                         After authorizing, the token will be saved to:\n  ~/.claurst/mcp-tokens/{}.json\n\n\
                          Then run /mcp connect {} to reconnect.",
                         server_name, auth_url, server_name, server_name
                     ));
@@ -2194,7 +2960,7 @@ impl McpCommand {
 
         // No live manager — static instructions.
         let server_url = srv.url.as_deref().unwrap_or("(URL not configured)");
-        let token_note = match cc_mcp::oauth::get_mcp_token(server_name) {
+        let token_note = match claurst_mcp::oauth::get_mcp_token(server_name) {
             Some(tok) if !tok.is_expired(60) => " (valid token stored)".to_string(),
             Some(_) => " (stored token is expired)".to_string(),
             None => " (no token stored)".to_string(),
@@ -2204,9 +2970,9 @@ impl McpCommand {
              Server URL: {}\n\n\
              To authenticate:\n\
              1. Open the server URL in your browser and complete OAuth\n\
-             2. The token is saved to ~/.claude/mcp-tokens/{}.json\n\
-             3. Restart Claude Code — the token will be used automatically\n\n\
-             Token storage: ~/.claude/mcp-tokens/{}.json",
+             2. The token is saved to ~/.claurst/mcp-tokens/{}.json\n\
+             3. Restart Claurst — the token will be used automatically\n\n\
+             Token storage: ~/.claurst/mcp-tokens/{}.json",
             server_name, token_note, server_url, server_name, server_name
         ))
     }
@@ -2217,7 +2983,7 @@ impl McpCommand {
             Some(m) => m,
             None => return CommandResult::Message(
                 "MCP manager is not active. No tool information available.\n\
-                 Restart Claude Code to connect to MCP servers.".to_string()
+                 Restart Claurst to connect to MCP servers.".to_string()
             ),
         };
 
@@ -2275,8 +3041,8 @@ impl McpCommand {
                 // No live manager — give useful instructions.
                 CommandResult::Message(format!(
                     "The MCP manager is not running in this session.\n\
-                     To connect '{}', restart Claude Code — servers connect automatically\n\
-                     on startup using the configuration in ~/.claude/settings.json.\n\
+                     To connect '{}', restart Claurst — servers connect automatically\n\
+                     on startup using the configuration in ~/.claurst/settings.json.\n\
                      \n\
                      If the server requires authentication, run /mcp auth {} first.",
                     server_name, server_name
@@ -2284,7 +3050,7 @@ impl McpCommand {
             }
             Some(manager) => {
                 let current = manager.server_status(server_name);
-                use cc_mcp::McpServerStatus;
+                use claurst_mcp::McpServerStatus;
                 match current {
                     McpServerStatus::Connected { tool_count } => {
                         CommandResult::Message(format!(
@@ -2311,8 +3077,8 @@ impl McpCommand {
                              The runtime MCP manager reconnects servers automatically.\n\
                              If the server stays disconnected:\n\
                              1. Check authentication: /mcp auth {}\n\
-                             2. Verify the command/URL in ~/.claude/settings.json\n\
-                             3. Restart Claude Code to force a full reconnect",
+                             2. Verify the command/URL in ~/.claurst/settings.json\n\
+                             3. Restart Claurst to force a full reconnect",
                             server_name,
                             manager.server_status(server_name).display(),
                             server_name
@@ -2339,7 +3105,7 @@ impl McpCommand {
         let mut lines = vec![format!("MCP Server Logs — '{}'\n──────────────────────", server_name)];
 
         if let Some(manager) = &ctx.mcp_manager {
-            use cc_mcp::McpServerStatus;
+            use claurst_mcp::McpServerStatus;
             let status = manager.server_status(server_name);
             lines.push(format!("Current status:  {}", status.display()));
 
@@ -2389,7 +3155,7 @@ impl McpCommand {
             }
         } else {
             lines.push("MCP manager is not active in this session.".to_string());
-            lines.push("Restart Claude Code to start the MCP runtime.".to_string());
+            lines.push("Restart Claurst to start the MCP runtime.".to_string());
         }
 
         // Hint about log files.
@@ -2484,9 +3250,9 @@ impl McpCommand {
                         let mut injected = String::new();
                         for msg in &result.messages {
                             let text = match &msg.content {
-                                cc_mcp::PromptMessageContent::Text { text } => text.clone(),
-                                cc_mcp::PromptMessageContent::Image { .. } => "[image]".to_string(),
-                                cc_mcp::PromptMessageContent::Resource { resource } => {
+                                claurst_mcp::PromptMessageContent::Text { text } => text.clone(),
+                                claurst_mcp::PromptMessageContent::Image { .. } => "[image]".to_string(),
+                                claurst_mcp::PromptMessageContent::Resource { resource } => {
                                     resource.to_string()
                                 }
                             };
@@ -2555,10 +3321,10 @@ impl SlashCommand for PermissionsCommand {
         match sub {
             "set" => {
                 let mode = match arg.to_lowercase().as_str() {
-                    "default" => cc_core::config::PermissionMode::Default,
-                    "accept-edits" | "accept_edits" => cc_core::config::PermissionMode::AcceptEdits,
-                    "bypass-permissions" | "bypass_permissions" => cc_core::config::PermissionMode::BypassPermissions,
-                    "plan" => cc_core::config::PermissionMode::Plan,
+                    "default" => claurst_core::config::PermissionMode::Default,
+                    "accept-edits" | "accept_edits" => claurst_core::config::PermissionMode::AcceptEdits,
+                    "bypass-permissions" | "bypass_permissions" => claurst_core::config::PermissionMode::BypassPermissions,
+                    "plan" => claurst_core::config::PermissionMode::Plan,
                     _ => return CommandResult::Error(
                         "Mode must be: default, accept-edits, bypass-permissions, or plan".to_string()
                     ),
@@ -2617,11 +3383,11 @@ impl SlashCommand for PermissionsCommand {
                 let mut new_config = ctx.config.clone();
                 new_config.allowed_tools.clear();
                 new_config.disallowed_tools.clear();
-                new_config.permission_mode = cc_core::config::PermissionMode::Default;
+                new_config.permission_mode = claurst_core::config::PermissionMode::Default;
                 if let Err(e) = save_settings_mutation(|s| {
                     s.config.allowed_tools.clear();
                     s.config.disallowed_tools.clear();
-                    s.config.permission_mode = cc_core::config::PermissionMode::Default;
+                    s.config.permission_mode = claurst_core::config::PermissionMode::Default;
                 }) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
@@ -2697,7 +3463,7 @@ impl SlashCommand for SessionCommand {
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         match args.trim() {
             "list" => {
-                let sessions = cc_core::history::list_sessions().await;
+                let sessions = claurst_core::history::list_sessions().await;
                 if sessions.is_empty() {
                     CommandResult::Message("No saved sessions found.".to_string())
                 } else {
@@ -2737,7 +3503,7 @@ impl SlashCommand for SessionCommand {
                     ))
                 } else {
                     // Show current session info + recent sessions list.
-                    let sessions = cc_core::history::list_sessions().await;
+                    let sessions = claurst_core::history::list_sessions().await;
                     let mut output = format!(
                         "Current session\n\
                          ───────────────\n\
@@ -2777,6 +3543,53 @@ impl SlashCommand for SessionCommand {
     }
 }
 
+// ---- /fork ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ForkCommand {
+    fn name(&self) -> &str { "fork" }
+    fn description(&self) -> &str { "Fork the current session into a new branch" }
+    fn help(&self) -> &str {
+        "Usage: /fork [message_index]\n\n\
+         Fork the current session at the specified message index (or at the\n\
+         current point if no index is given).  Creates a new session containing\n\
+         messages up to the fork point.\n\n\
+         Examples:\n\
+           /fork        \u{2014} fork at the current end of the conversation\n\
+           /fork 5      \u{2014} fork after message 5"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let fork_index: Option<usize> = args.trim().parse().ok();
+        let messages = &ctx.messages;
+        let fork_at = fork_index.unwrap_or(messages.len()).min(messages.len());
+        let forked_messages: Vec<_> = messages[..fork_at].to_vec();
+
+        let mut new_session = claurst_core::history::ConversationSession::new(
+            ctx.config.effective_model().to_string(),
+        );
+        new_session.messages = forked_messages;
+        new_session.parent_session_id = Some(ctx.session_id.clone());
+        new_session.fork_point_message_index = Some(fork_at);
+        new_session.title = Some(format!(
+            "Fork of {}",
+            ctx.session_title.as_deref().unwrap_or("session")
+        ));
+        new_session.working_dir = Some(
+            ctx.working_dir.to_string_lossy().to_string(),
+        );
+
+        let new_id = new_session.id.clone();
+        match claurst_core::history::save_session(&new_session).await {
+            Ok(()) => CommandResult::Message(format!(
+                "Session forked at message {}. New session: {}\nUse /resume {} to switch to it.",
+                fork_at, new_id, new_id
+            )),
+            Err(e) => CommandResult::Error(format!("Failed to save forked session: {}", e)),
+        }
+    }
+}
+
 // ---- /thinking -----------------------------------------------------------
 
 #[async_trait]
@@ -2796,7 +3609,7 @@ impl SlashCommand for ThinkingCommand {
         } else {
             CommandResult::Message(format!(
                 "Extended thinking is available with {}.\n\
-                 You can request thinking by asking Claude to 'think step by step' or \
+                 You can request thinking by asking Claurst to 'think step by step' or \
                  'think carefully before answering'.",
                 model
             ))
@@ -2806,48 +3619,276 @@ impl SlashCommand for ThinkingCommand {
 
 // ---- /export -------------------------------------------------------------
 
+/// Format a single `Message` as a Markdown section.
+///
+/// User messages render as `## User\n<text>`.
+/// Assistant messages render as `## Assistant\n<text>` followed by
+/// `### Tool: <name>\n**Input:** …\n**Output:** …` for each tool call pair.
+fn export_message_to_markdown(
+    msg: &claurst_core::types::Message,
+    all_messages: &[claurst_core::types::Message],
+    msg_idx: usize,
+) -> String {
+    use claurst_core::types::{ContentBlock, MessageContent, Role, ToolResultContent};
+
+    let role_label = match msg.role {
+        Role::User => "User",
+        Role::Assistant => "Assistant",
+    };
+
+    let mut out = format!("## {}\n", role_label);
+
+    match &msg.content {
+        MessageContent::Text(t) => {
+            out.push_str(t);
+            out.push('\n');
+        }
+        MessageContent::Blocks(blocks) => {
+            // Collect text first
+            let mut text_parts: Vec<&str> = Vec::new();
+            let mut tool_uses: Vec<(&str, &str, &serde_json::Value)> = Vec::new(); // (id, name, input)
+
+            for block in blocks {
+                match block {
+                    ContentBlock::Text { text } => {
+                        text_parts.push(text.as_str());
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        tool_uses.push((id.as_str(), name.as_str(), input));
+                    }
+                    ContentBlock::Thinking { thinking, .. } => {
+                        // Include thinking blocks as a collapsible hint
+                        out.push_str("\n<details><summary>Thinking</summary>\n\n");
+                        out.push_str(thinking);
+                        out.push_str("\n</details>\n\n");
+                    }
+                    _ => {}
+                }
+            }
+
+            if !text_parts.is_empty() {
+                out.push_str(&text_parts.join(""));
+                out.push('\n');
+            }
+
+            // For each tool use, look for the matching ToolResult in the NEXT user message
+            for (tool_id, tool_name, tool_input) in &tool_uses {
+                out.push_str(&format!("\n### Tool: {}\n", tool_name));
+                let input_str = serde_json::to_string_pretty(tool_input)
+                    .unwrap_or_else(|_| tool_input.to_string());
+                out.push_str(&format!("**Input:** `{}`\n", input_str.replace('\n', " ")));
+
+                // Search the next user message for a matching ToolResult
+                let mut found_output: Option<String> = None;
+                'search: for next_msg in all_messages.iter().skip(msg_idx + 1) {
+                    if let MessageContent::Blocks(next_blocks) = &next_msg.content {
+                        for nb in next_blocks {
+                            if let ContentBlock::ToolResult { tool_use_id, content, is_error } = nb {
+                                if tool_use_id.as_str() == *tool_id {
+                                    let text = match content {
+                                        ToolResultContent::Text(t) => t.clone(),
+                                        ToolResultContent::Blocks(bs) => bs
+                                            .iter()
+                                            .filter_map(|b| {
+                                                if let ContentBlock::Text { text } = b {
+                                                    Some(text.as_str())
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(""),
+                                    };
+                                    let label = if is_error.unwrap_or(false) { "Error" } else { "Output" };
+                                    found_output = Some(format!("**{}:** `{}`\n",
+                                        label,
+                                        text.lines().next().unwrap_or(&text).trim()));
+                                    break 'search;
+                                }
+                            }
+                        }
+                    }
+                }
+                out.push_str(found_output.as_deref().unwrap_or("**Output:** *(pending)*\n"));
+            }
+        }
+    }
+
+    out
+}
+
+/// Build the full markdown export string.
+fn build_markdown_export(ctx: &CommandContext) -> String {
+    let mut out = String::new();
+    out.push_str("# Conversation Export\n\n");
+    out.push_str(&format!("- **Session ID:** {}\n", ctx.session_id));
+    out.push_str(&format!("- **Model:** {}\n", ctx.config.effective_model()));
+    out.push_str(&format!("- **Exported:** {}\n", chrono::Utc::now().to_rfc3339()));
+    if let Some(ref title) = ctx.session_title {
+        out.push_str(&format!("- **Title:** {}\n", title));
+    }
+    out.push_str(&format!("- **Messages:** {}\n", ctx.messages.len()));
+    out.push_str("\n---\n\n");
+
+    let messages = ctx.messages.clone();
+    for (i, msg) in messages.iter().enumerate() {
+        out.push_str(&export_message_to_markdown(msg, &messages, i));
+        out.push_str("\n---\n\n");
+    }
+    out
+}
+
+/// Build the full JSON export value.
+fn build_json_export(ctx: &CommandContext) -> serde_json::Value {
+    serde_json::json!({
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "session_id": ctx.session_id,
+        "session_title": ctx.session_title,
+        "model": ctx.config.effective_model(),
+        "message_count": ctx.messages.len(),
+        "messages": ctx.messages.iter().map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content": m.content,
+                "uuid": m.uuid,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
 #[async_trait]
 impl SlashCommand for ExportCommand {
     fn name(&self) -> &str { "export" }
-    fn description(&self) -> &str { "Export conversation to a file" }
+    fn description(&self) -> &str { "Export conversation to markdown or JSON" }
     fn help(&self) -> &str {
-        "Usage: /export [filename]\n\
-         Export the current conversation as JSON. Defaults to claude_export_<timestamp>.json."
+        "Usage: /export [--format markdown|json] [--output <file>]\n\n\
+         Export the current conversation.\n\n\
+         Flags:\n\
+           --format markdown   Render as readable Markdown (default for .md files)\n\
+           --format json       Full structured JSON export (default)\n\
+           --output <path>     Write to file; if omitted, prints to the terminal\n\n\
+         Examples:\n\
+           /export\n\
+           /export --format markdown\n\
+           /export --format json --output chat.json\n\
+           /export --output conversation.md"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let filename = if args.trim().is_empty() {
-            format!(
-                "claude_export_{}.json",
-                chrono::Utc::now().format("%Y%m%d_%H%M%S")
-            )
-        } else {
-            args.trim().to_string()
+        // ── Parse flags ────────────────────────────────────────────────────
+        let args = args.trim();
+        let mut format: Option<&str> = None; // "markdown" | "json"
+        let mut output_path: Option<String> = None;
+
+        // Simple hand-rolled flag parser (no clap dep in commands crate)
+        let tokens: Vec<&str> = args.split_whitespace().collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--format" | "-f" => {
+                    if i + 1 < tokens.len() {
+                        format = Some(tokens[i + 1]);
+                        i += 2;
+                    } else {
+                        return CommandResult::Error(
+                            "--format requires a value: markdown or json".to_string()
+                        );
+                    }
+                }
+                "--output" | "-o" => {
+                    if i + 1 < tokens.len() {
+                        output_path = Some(tokens[i + 1].to_string());
+                        i += 2;
+                    } else {
+                        return CommandResult::Error(
+                            "--output requires a file path".to_string()
+                        );
+                    }
+                }
+                other if !other.starts_with('-') => {
+                    // Bare filename as positional arg (legacy compat)
+                    if output_path.is_none() {
+                        output_path = Some(other.to_string());
+                    }
+                    i += 1;
+                }
+                other => {
+                    return CommandResult::Error(format!("Unknown flag: {}", other));
+                }
+            }
+        }
+
+        // ── Determine format from output path extension if not explicit ─────
+        let resolved_format = match format {
+            Some("markdown") | Some("md") => "markdown",
+            Some("json") => "json",
+            Some(other) => {
+                return CommandResult::Error(format!(
+                    "Unknown format '{}'. Use 'markdown' or 'json'.", other
+                ));
+            }
+            None => {
+                // Infer from output file extension
+                if let Some(ref path) = output_path {
+                    if path.ends_with(".md") || path.ends_with(".markdown") {
+                        "markdown"
+                    } else {
+                        "json"
+                    }
+                } else {
+                    "json"
+                }
+            }
         };
 
-        let path = ctx.working_dir.join(&filename);
-        let export = serde_json::json!({
-            "exported_at": chrono::Utc::now().to_rfc3339(),
-            "model": ctx.config.effective_model(),
-            "message_count": ctx.messages.len(),
-            "messages": ctx.messages.iter().map(|m| serde_json::json!({
-                "role": m.role,
-                "content": m.get_all_text(),
-            })).collect::<Vec<_>>(),
-        });
-
-        let json = match serde_json::to_string_pretty(&export) {
-            Ok(j) => j,
-            Err(e) => return CommandResult::Error(format!("Failed to serialize: {}", e)),
+        // ── Build content ───────────────────────────────────────────────────
+        let content: String = match resolved_format {
+            "markdown" => build_markdown_export(ctx),
+            _ => {
+                let val = build_json_export(ctx);
+                match serde_json::to_string_pretty(&val) {
+                    Ok(j) => j,
+                    Err(e) => return CommandResult::Error(format!("Serialization error: {}", e)),
+                }
+            }
         };
 
-        match std::fs::write(&path, &json) {
-            Ok(_) => CommandResult::Message(format!(
-                "Conversation exported to {}\n({} messages)",
-                path.display(),
-                ctx.messages.len()
-            )),
-            Err(e) => CommandResult::Error(format!("Failed to write {}: {}", filename, e)),
+        // ── Write or return ─────────────────────────────────────────────────
+        match output_path {
+            Some(ref filename) => {
+                // Default extension if the user didn't provide one
+                let filename = if !filename.contains('.') {
+                    format!(
+                        "{}.{}",
+                        filename,
+                        if resolved_format == "markdown" { "md" } else { "json" }
+                    )
+                } else {
+                    filename.to_string()
+                };
+
+                let path = if std::path::Path::new(&filename).is_absolute() {
+                    std::path::PathBuf::from(&filename)
+                } else {
+                    ctx.working_dir.join(&filename)
+                };
+
+                match tokio::fs::write(&path, &content).await {
+                    Ok(()) => CommandResult::Message(format!(
+                        "Conversation exported to {} ({} messages, {} format)",
+                        path.display(),
+                        ctx.messages.len(),
+                        resolved_format,
+                    )),
+                    Err(e) => CommandResult::Error(format!(
+                        "Failed to write {}: {}", path.display(), e
+                    )),
+                }
+            }
+            None => {
+                // Print to terminal
+                CommandResult::Message(content)
+            }
         }
     }
 }
@@ -2858,15 +3899,15 @@ impl SlashCommand for ExportCommand {
 impl SlashCommand for SkillsCommand {
     fn name(&self) -> &str { "skills" }
     fn aliases(&self) -> Vec<&str> { vec!["skill"] }
-    fn description(&self) -> &str { "List available skills in .claude/commands/" }
+    fn description(&self) -> &str { "List available skills in .claurst/commands/" }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let mut found: Vec<String> = Vec::new();
         let dirs = [
-            ctx.working_dir.join(".claude").join("commands"),
+            ctx.working_dir.join(".claurst").join("commands"),
             dirs::home_dir()
                 .unwrap_or_default()
-                .join(".claude")
+                .join(".claurst")
                 .join("commands"),
         ];
 
@@ -2887,7 +3928,7 @@ impl SlashCommand for SkillsCommand {
         }
 
         // Include skills contributed by installed plugins.
-        if let Some(registry) = cc_plugins::global_plugin_registry() {
+        if let Some(registry) = claurst_plugins::global_plugin_registry() {
             for skill_dir in registry.all_skill_paths() {
                 if let Ok(entries) = std::fs::read_dir(&skill_dir) {
                     for entry in entries.flatten() {
@@ -2915,19 +3956,48 @@ impl SlashCommand for SkillsCommand {
             }
         }
 
-        if found.is_empty() {
+        // Include discovered skills from .claurst/skills/ and configured paths/URLs.
+        let discovered = claurst_core::discover_skills(
+            &ctx.working_dir,
+            &ctx.config.skills,
+        );
+
+        let mut output = if found.is_empty() && discovered.is_empty() {
             return CommandResult::Message(
-                "No skills found.\nCreate .md files in .claude/commands/ to define skills.\n\
-                 Example: .claude/commands/review.md".to_string(),
+                "No skills found.\nCreate .md files in .claurst/commands/ to define skills.\n\
+                 Example: .claurst/commands/review.md".to_string(),
             );
+        } else if found.is_empty() {
+            String::new()
+        } else {
+            found.sort();
+            format!(
+                "Available skills ({}):\n{}",
+                found.len(),
+                found.iter().map(|s| format!("  /{}", s)).collect::<Vec<_>>().join("\n")
+            )
+        };
+
+        if !discovered.is_empty() {
+            let mut disc_list: Vec<(&String, &claurst_core::DiscoveredSkill)> =
+                discovered.iter().collect();
+            disc_list.sort_by_key(|(name, _)| name.as_str());
+
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&format!("\nDiscovered skills ({}):\n", disc_list.len()));
+            for (name, skill) in disc_list {
+                output.push_str(&format!(
+                    "  /{} — {} ({})\n",
+                    name,
+                    skill.description,
+                    skill.source_path.display()
+                ));
+            }
         }
 
-        found.sort();
-        CommandResult::Message(format!(
-            "Available skills ({}):\n{}",
-            found.len(),
-            found.iter().map(|s| format!("  /{}", s)).collect::<Vec<_>>().join("\n")
-        ))
+        CommandResult::Message(output.trim_end().to_string())
     }
 }
 
@@ -2957,29 +4027,74 @@ impl SlashCommand for RewindCommand {
 impl SlashCommand for StatsCommand {
     fn name(&self) -> &str { "stats" }
     fn description(&self) -> &str { "Show token usage and cost statistics" }
+    fn help(&self) -> &str {
+        "Usage: /stats\n\n\
+         Shows detailed token usage and cost breakdown for the current session,\n\
+         including cache creation/read token counts, turn counts, and session duration.\n\
+         Use /usage for quota and account info. Use /cost for a quick cost summary."
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let input = ctx.cost_tracker.input_tokens();
         let output = ctx.cost_tracker.output_tokens();
+        let cache_creation = ctx.cost_tracker.cache_creation_tokens();
+        let cache_read = ctx.cost_tracker.cache_read_tokens();
+        let total = ctx.cost_tracker.total_tokens();
         let cost = ctx.cost_tracker.total_cost_usd();
-        let turns = ctx.messages.len();
         let model = ctx.config.effective_model();
 
+        // Count user/assistant turns separately.
+        let user_turns = ctx.messages.iter()
+            .filter(|m| m.role == claurst_core::types::Role::User)
+            .count();
+        let assistant_turns = ctx.messages.iter()
+            .filter(|m| m.role == claurst_core::types::Role::Assistant)
+            .count();
+
+        // Count tool-use invocations.
+        let tool_calls: usize = ctx.messages.iter()
+            .map(|m| m.get_tool_use_blocks().len())
+            .sum();
+
+        // Cost breakdown note: cache-read tokens are cheaper than input, and
+        // cache-creation tokens are slightly more expensive. Provide a note if
+        // caching is active.
+        let cache_note = if cache_creation > 0 || cache_read > 0 {
+            format!(
+                "\n  (Cache write: {:>10}    Cache read: {:>10})",
+                cache_creation, cache_read
+            )
+        } else {
+            String::new()
+        };
+
         CommandResult::Message(format!(
-            "Session statistics\n\
-             ──────────────────\n\
-             Model:          {}\n\
-             Messages:       {}\n\
-             Input tokens:   {}\n\
-             Output tokens:  {}\n\
-             Total tokens:   {}\n\
-             Estimated cost: ${:.4}",
-            model,
-            turns,
-            input,
-            output,
-            input + output,
-            cost
+            "Session Statistics\n\
+             ══════════════════\n\
+             Model:          {model}\n\
+             \n\
+             Conversation:\n\
+               User turns:     {user_turns:>10}\n\
+               Assistant turns:{assistant_turns:>10}\n\
+               Tool calls:     {tool_calls:>10}\n\
+             \n\
+             Token usage:\n\
+               Input:          {input:>10}\n\
+               Output:         {output:>10}\n\
+               Total:          {total:>10}{cache_note}\n\
+             \n\
+             Estimated cost:   ${cost:.4}\n\
+             \n\
+             Use /usage for quota info · /cost for quick cost · /extra-usage for per-call breakdown",
+            model = model,
+            user_turns = user_turns,
+            assistant_turns = assistant_turns,
+            tool_calls = tool_calls,
+            input = input,
+            output = output,
+            total = total,
+            cache_note = cache_note,
+            cost = cost,
         ))
     }
 }
@@ -3032,15 +4147,116 @@ impl SlashCommand for FilesCommand {
 impl SlashCommand for RenameCommand {
     fn name(&self) -> &str { "rename" }
     fn description(&self) -> &str { "Rename the current session" }
-    fn help(&self) -> &str { "Usage: /rename <new name>" }
+    fn help(&self) -> &str {
+        "Usage: /rename [new name]\n\n\
+         With a name: sets the session title immediately.\n\
+         With no argument: auto-generates a kebab-case name from the conversation.\n\n\
+         Examples:\n\
+           /rename fix-login-bug\n\
+           /rename              — auto-generate from conversation history"
+    }
 
-    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let name = args.trim();
-        if name.is_empty() {
-            return CommandResult::Error("Usage: /rename <new name>".to_string());
+
+        if !name.is_empty() {
+            // Explicit name provided: rename immediately.
+            return CommandResult::RenameSession(name.to_string());
         }
 
-        CommandResult::RenameSession(name.to_string())
+        // No name given — auto-generate from conversation context.
+        if ctx.messages.is_empty() {
+            return CommandResult::Error(
+                "No conversation context yet. Usage: /rename <name>".to_string(),
+            );
+        }
+
+        // Build a short conversation excerpt (up to ~2000 chars) for the model.
+        let excerpt: String = ctx
+            .messages
+            .iter()
+            .take(20)
+            .filter_map(|m| {
+                let text = m.get_all_text();
+                if text.is_empty() { return None; }
+                let role = match m.role {
+                    claurst_core::types::Role::User => "User",
+                    claurst_core::types::Role::Assistant => "Assistant",
+                };
+                Some(format!("{}: {}", role, text.chars().take(300).collect::<String>()))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if excerpt.is_empty() {
+            return CommandResult::Error(
+                "No text content in conversation. Usage: /rename <name>".to_string(),
+            );
+        }
+
+        // Try to build an API client from the current config.
+        let client = match claurst_api::AnthropicClient::from_config(&ctx.config) {
+            Ok(c) => c,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Could not create API client for auto-naming: {e}\n\
+                     Use /rename <name> to set the name manually."
+                ));
+            }
+        };
+
+        let system_prompt = "Generate a short kebab-case name (2-4 words) that captures the \
+            main topic of this conversation. Use lowercase words separated by hyphens. \
+            Examples: fix-login-bug, add-auth-feature, refactor-api-client. \
+            Respond with ONLY the name, nothing else.";
+
+        let request = claurst_api::CreateMessageRequest::builder(
+            "claude-haiku-4-5".to_string(),
+            64,
+        )
+        .system_text(system_prompt)
+        .add_message(claurst_api::ApiMessage {
+            role: "user".to_string(),
+            content: serde_json::Value::String(
+                format!("Conversation to name:\n\n{}", &excerpt[..excerpt.len().min(2000)])
+            ),
+        })
+        .build();
+
+        match client.create_message(request).await {
+            Ok(response) => {
+                // Extract text from the response content blocks.
+                let raw_text: String = response.content.iter()
+                    .filter_map(|block| {
+                        block.get("text").and_then(|v| v.as_str()).map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+                    .trim()
+                    .to_string();
+
+                let generated = raw_text
+                    .to_lowercase()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '-')
+                    .collect::<String>();
+
+                // Trim leading/trailing hyphens and ensure non-empty.
+                let cleaned = generated.trim_matches('-').to_string();
+                if cleaned.is_empty() {
+                    return CommandResult::Error(
+                        "Could not generate a valid name from conversation. \
+                         Use /rename <name> to set manually.".to_string(),
+                    );
+                }
+
+                CommandResult::RenameSession(cleaned)
+            }
+            Err(e) => CommandResult::Error(format!(
+                "Auto-name generation failed: {e}\n\
+                 Use /rename <name> to set the name manually."
+            )),
+        }
     }
 }
 
@@ -3109,7 +4325,7 @@ impl SlashCommand for SummaryCommand {
 #[async_trait]
 impl SlashCommand for CommitCommand {
     fn name(&self) -> &str { "commit" }
-    fn description(&self) -> &str { "Ask Claude to commit staged changes" }
+    fn description(&self) -> &str { "Ask Claurst to commit staged changes" }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let extra = if args.trim().is_empty() {
@@ -3129,7 +4345,7 @@ impl SlashCommand for CommitCommand {
 }
 
 // ---------------------------------------------------------------------------
-// UI settings helpers (stored in ~/.claude/ui-settings.json)
+// UI settings helpers (stored in ~/.claurst/ui-settings.json)
 // These hold things not present in the core Config struct.
 // ---------------------------------------------------------------------------
 
@@ -3153,10 +4369,14 @@ struct UiSettings {
     pub prompt_color: Option<String>,
     #[serde(default)]
     pub sandbox_mode: Option<bool>,
+    /// Shell command patterns excluded from sandboxing (glob-style strings).
+    /// Mirrors TS `excludedCommands` in settings.local.json.
+    #[serde(default)]
+    pub sandbox_excluded_commands: Vec<String>,
 }
 
 fn ui_settings_path() -> std::path::PathBuf {
-    cc_core::config::Settings::config_dir().join("ui-settings.json")
+    claurst_core::config::Settings::config_dir().join("ui-settings.json")
 }
 
 fn load_ui_settings() -> UiSettings {
@@ -3199,7 +4419,7 @@ impl SlashCommand for RemoteControlCommand {
     fn description(&self) -> &str { "Show or manage the remote control (Bridge) connection" }
     fn help(&self) -> &str {
         "Usage: /remote-control [start|stop|status]\n\n\
-         The Bridge feature lets you connect your local Claude Code CLI to the\n\
+         The Bridge feature lets you connect your local Claurst CLI to the\n\
          claude.ai web UI or mobile app.\n\n\
          Subcommands:\n\
          /remote-control          Show current bridge status and connection URL\n\
@@ -3209,7 +4429,7 @@ impl SlashCommand for RemoteControlCommand {
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let settings = match cc_core::config::Settings::load().await {
+        let settings = match claurst_core::config::Settings::load().await {
             Ok(s) => s,
             Err(e) => return CommandResult::Error(format!("Failed to load settings: {}", e)),
         };
@@ -3222,10 +4442,10 @@ impl SlashCommand for RemoteControlCommand {
                     .map(|h| h.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| "(unknown host)".to_string());
 
-                let bridge_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+                let bridge_url = std::env::var("CLAURST_BRIDGE_URL")
                     .unwrap_or_else(|_| "https://claude.ai".to_string());
 
-                let token_status = if std::env::var("CLAUDE_CODE_BRIDGE_TOKEN").is_ok()
+                let token_status = if std::env::var("CLAURST_BRIDGE_TOKEN").is_ok()
                     || std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").is_ok()
                 {
                     "configured via environment variable"
@@ -3243,7 +4463,7 @@ impl SlashCommand for RemoteControlCommand {
                          ──────────────\n\
                          Session URL:  {url}\n\
                          Share this URL or QR code with others to let them connect\n\
-                         to this Claude Code session from the claude.ai web UI.\n",
+                         to this Claurst session from the claude.ai web UI.\n",
                         url = url
                     )
                 } else {
@@ -3251,14 +4471,14 @@ impl SlashCommand for RemoteControlCommand {
                 };
 
                 // Device fingerprint (first 12 chars are enough for display)
-                let fingerprint = cc_bridge::device_fingerprint();
+                let fingerprint = claurst_bridge::device_fingerprint();
                 let fp_short = &fingerprint[..fingerprint.len().min(12)];
 
                 CommandResult::Message(format!(
                     "Remote Control (Bridge)\n\
                      ═══════════════════════\n\
                      What it does: lets you connect the claude.ai web UI or mobile app\n\
-                     to this running Claude Code CLI session on your local machine.\n\
+                     to this running Claurst CLI session on your local machine.\n\
                      All prompts and responses are relayed bidirectionally.\n\
                      \n\
                      Local Machine\n\
@@ -3275,9 +4495,9 @@ impl SlashCommand for RemoteControlCommand {
                      How to connect\n\
                      ──────────────\n\
                      1. Obtain a session token from claude.ai (Settings → Remote Control)\n\
-                     2. Set it:  export CLAUDE_CODE_BRIDGE_TOKEN=<your-token>\n\
+                     2. Set it:  export CLAURST_BRIDGE_TOKEN=<your-token>\n\
                      3. Enable:  /remote-control start\n\
-                     4. Restart Claude Code — the bridge will connect automatically\n\
+                     4. Restart Claurst — the bridge will connect automatically\n\
                      5. Open {bridge_url}/claude-code in your browser\n\
                      \n\
                      Note: Full bridge polling requires server-side session infrastructure.\n\
@@ -3298,9 +4518,9 @@ impl SlashCommand for RemoteControlCommand {
                 if let Err(e) = save_settings_mutation(|s| s.remote_control_at_startup = true) {
                     return CommandResult::Error(format!("Failed to save settings: {}", e));
                 }
-                let bridge_url = std::env::var("CLAUDE_CODE_BRIDGE_URL")
+                let bridge_url = std::env::var("CLAURST_BRIDGE_URL")
                     .unwrap_or_else(|_| "https://claude.ai".to_string());
-                let token_note = if std::env::var("CLAUDE_CODE_BRIDGE_TOKEN").is_ok()
+                let token_note = if std::env::var("CLAURST_BRIDGE_TOKEN").is_ok()
                     || std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").is_ok()
                 {
                     "Session token detected in environment — bridge will connect on next start."
@@ -3309,13 +4529,13 @@ impl SlashCommand for RemoteControlCommand {
                     format!(
                         "No session token found.\n\
                          Get a token from {bridge_url} (Settings → Remote Control)\n\
-                         then run:  export CLAUDE_CODE_BRIDGE_TOKEN=<token>",
+                         then run:  export CLAURST_BRIDGE_TOKEN=<token>",
                         bridge_url = bridge_url
                     )
                 };
                 CommandResult::Message(format!(
                     "Remote control bridge enabled at startup.\n\
-                     Restart Claude Code to activate the bridge connection.\n\n\
+                     Restart Claurst to activate the bridge connection.\n\n\
                      {token_note}",
                     token_note = token_note
                 ))
@@ -3346,7 +4566,7 @@ impl SlashCommand for RemoteEnvCommand {
     fn description(&self) -> &str { "Show and manage environment variables for remote sessions" }
     fn help(&self) -> &str {
         "Usage: /remote-env [set <KEY> <VALUE> | unset <KEY> | list]\n\n\
-         Manages env vars stored in config that are forwarded to remote Claude Code sessions.\n\
+         Manages env vars stored in config that are forwarded to remote Claurst sessions.\n\
          These are persisted to settings under the 'env' key."
     }
 
@@ -3520,11 +4740,11 @@ impl SlashCommand for CopyCommand {
         let n: usize = args.trim().parse().unwrap_or(1).max(1);
 
         // Find the Nth most recent assistant message
-        let assistant_msgs: Vec<&cc_core::types::Message> = ctx
+        let assistant_msgs: Vec<&claurst_core::types::Message> = ctx
             .messages
             .iter()
             .rev()
-            .filter(|m| m.role == cc_core::types::Role::Assistant)
+            .filter(|m| m.role == claurst_core::types::Role::Assistant)
             .take(n)
             .collect();
 
@@ -3583,68 +4803,499 @@ impl SlashCommand for CopyCommand {
 }
 
 // ---- /chrome -------------------------------------------------------------
+//
+// Real CDP-over-WebSocket implementation.
+//
+// Chrome must be launched with:
+//   chrome --remote-debugging-port=9222 --no-first-run
+//
+// The connection is stored in a process-wide lazy mutex so subsequent
+// subcommand calls reuse the same WebSocket session.
+
+mod chrome_cdp {
+    use base64::Engine as _;
+    use once_cell::sync::Lazy;
+    use parking_lot::Mutex;
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::{
+        connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+    };
+    use futures::{SinkExt, StreamExt};
+
+    // -----------------------------------------------------------------------
+    // Global session state
+    // -----------------------------------------------------------------------
+
+    #[allow(dead_code)]
+    pub struct ChromeSession {
+        pub ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        pub port: u16,
+        pub tab_url: String,
+    }
+
+    static SESSION: Lazy<Mutex<Option<ChromeSession>>> = Lazy::new(|| Mutex::new(None));
+    static MSG_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn next_id() -> u64 {
+        MSG_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    // -----------------------------------------------------------------------
+    // Low-level CDP helpers
+    // -----------------------------------------------------------------------
+
+    /// Send a CDP method call and wait for the matching response.
+    /// Returns the full response object (including `result` / `error`).
+    async fn cdp_call(
+        ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Value> {
+        let id = next_id();
+        let request = json!({ "id": id, "method": method, "params": params });
+        ws.send(WsMessage::Text(request.to_string().into())).await?;
+
+        // Drain messages until we get the one with our id (ignore events).
+        loop {
+            let raw = ws
+                .next()
+                .await
+                .ok_or_else(|| anyhow::anyhow!("WebSocket closed unexpectedly"))??;
+            let text: String = match raw {
+                WsMessage::Text(t) => t.to_string(),
+                WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+                WsMessage::Close(_) => {
+                    return Err(anyhow::anyhow!("WebSocket closed by Chrome"));
+                }
+                _ => continue,
+            };
+            let val: Value = serde_json::from_str(&text)?;
+            if val["id"] == id {
+                if let Some(err) = val.get("error") {
+                    return Err(anyhow::anyhow!("CDP error: {}", err));
+                }
+                return Ok(val);
+            }
+            // It's an event or different response — keep waiting.
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Session take/restore helpers
+    //
+    // We avoid holding a MutexGuard across await points by taking ownership
+    // of the session, performing all async operations with it, then putting
+    // it back into the global.
+    // -----------------------------------------------------------------------
+
+    fn take_session() -> anyhow::Result<ChromeSession> {
+        SESSION.lock().take().ok_or_else(|| {
+            anyhow::anyhow!("No active Chrome session. Run `/chrome connect` first.")
+        })
+    }
+
+    fn store_session(s: ChromeSession) {
+        *SESSION.lock() = Some(s);
+    }
+
+    // -----------------------------------------------------------------------
+    // Public helpers called from the SlashCommand impl
+    // -----------------------------------------------------------------------
+
+    /// Connect to Chrome at the given port.
+    /// Picks the first available target (tab/page).
+    pub async fn connect(port: u16) -> anyhow::Result<String> {
+        let http_url = format!("http://localhost:{}/json/list", port);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()?;
+        let tabs: Value = client.get(&http_url).send().await?.json().await?;
+
+        let ws_url = tabs
+            .as_array()
+            .and_then(|arr| {
+                arr.iter().find(|t| t["type"] == "page").and_then(|t| {
+                    t["webSocketDebuggerUrl"].as_str().map(|s| s.to_string())
+                })
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No debuggable page found on port {}. \
+                     Make sure Chrome has at least one open tab.",
+                    port
+                )
+            })?;
+
+        let tab_url = tabs
+            .as_array()
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|t| t["type"] == "page")
+                    .and_then(|t| t["url"].as_str().map(|s| s.to_string()))
+            })
+            .unwrap_or_default();
+
+        let (ws, _) = connect_async(&ws_url).await.map_err(|e| {
+            anyhow::anyhow!("WebSocket connect to {} failed: {}", ws_url, e)
+        })?;
+
+        let mut session = ChromeSession { ws, port, tab_url: tab_url.clone() };
+        // Enable Page domain so captureScreenshot etc. work.
+        cdp_call(&mut session.ws, "Page.enable", json!({})).await?;
+        // Enable Runtime domain for eval/click/fill.
+        cdp_call(&mut session.ws, "Runtime.enable", json!({})).await?;
+
+        store_session(session);
+
+        Ok(format!(
+            "Connected to Chrome on port {} (tab: {})",
+            port, tab_url
+        ))
+    }
+
+    /// Disconnect the current session.
+    pub fn disconnect() -> String {
+        let mut guard = SESSION.lock();
+        if guard.is_some() {
+            *guard = None;
+            "Disconnected from Chrome.".to_string()
+        } else {
+            "No active Chrome session.".to_string()
+        }
+    }
+
+    /// Navigate to a URL.
+    pub async fn navigate(url: &str) -> anyhow::Result<String> {
+        let url = url.to_string();
+        let mut s = take_session()?;
+        let result = async {
+            let resp = cdp_call(&mut s.ws, "Page.navigate", json!({ "url": url })).await?;
+            let frame_id = resp["result"]["frameId"].as_str().unwrap_or("unknown");
+            Ok(format!("Navigated. frameId={}", frame_id))
+        }
+        .await;
+        store_session(s);
+        result
+    }
+
+    /// Take a screenshot, write PNG to a temp file, return the path.
+    pub async fn screenshot() -> anyhow::Result<String> {
+        let mut s = take_session()?;
+        let result = async {
+            let resp = cdp_call(
+                &mut s.ws,
+                "Page.captureScreenshot",
+                json!({ "format": "png", "captureBeyondViewport": false }),
+            )
+            .await?;
+            let b64 = resp["result"]["data"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("No screenshot data in response"))?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+
+            let tmp = tempfile::Builder::new()
+                .prefix("cc-chrome-")
+                .suffix(".png")
+                .tempfile()?;
+            let path = tmp.path().to_path_buf();
+            std::fs::write(&path, &bytes)?;
+            // Persist file past the NamedTempFile drop.
+            let _ = tmp.keep()?;
+            Ok(format!("Screenshot saved to {}", path.display()))
+        }
+        .await;
+        store_session(s);
+        result
+    }
+
+    /// Click the first element matching a CSS selector.
+    pub async fn click(selector: &str) -> anyhow::Result<String> {
+        let sel_json = serde_json::to_string(selector)?;
+        let js = format!(
+            r#"(function(){{
+                var el=document.querySelector({sel});
+                if(!el)return 'ELEMENT_NOT_FOUND';
+                var r=el.getBoundingClientRect();
+                return JSON.stringify({{x:r.left+r.width/2,y:r.top+r.height/2}});
+            }})()"#,
+            sel = sel_json
+        );
+        let selector = selector.to_string();
+        let mut s = take_session()?;
+        let result = async {
+            let resp = cdp_call(
+                &mut s.ws,
+                "Runtime.evaluate",
+                json!({ "expression": js, "returnByValue": true }),
+            )
+            .await?;
+            let val_str = resp["result"]["result"]["value"].as_str().unwrap_or("");
+            if val_str == "ELEMENT_NOT_FOUND" {
+                return Err(anyhow::anyhow!(
+                    "No element found for selector: {}",
+                    selector
+                ));
+            }
+            let coords: Value = serde_json::from_str(val_str)?;
+            let x = coords["x"].as_f64().unwrap_or(0.0);
+            let y = coords["y"].as_f64().unwrap_or(0.0);
+
+            cdp_call(
+                &mut s.ws,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mousePressed", "x": x, "y": y,
+                    "button": "left", "clickCount": 1
+                }),
+            )
+            .await?;
+            cdp_call(
+                &mut s.ws,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseReleased", "x": x, "y": y,
+                    "button": "left", "clickCount": 1
+                }),
+            )
+            .await?;
+
+            Ok(format!("Clicked '{}' at ({:.0}, {:.0})", selector, x, y))
+        }
+        .await;
+        store_session(s);
+        result
+    }
+
+    /// Fill an input field.
+    pub async fn fill(selector: &str, text: &str) -> anyhow::Result<String> {
+        let js = format!(
+            r#"(function(){{
+                var el=document.querySelector({sel});
+                if(!el)return false;
+                el.focus();
+                el.value={val};
+                el.dispatchEvent(new Event('input',{{bubbles:true}}));
+                el.dispatchEvent(new Event('change',{{bubbles:true}}));
+                return true;
+            }})()"#,
+            sel = serde_json::to_string(selector)?,
+            val = serde_json::to_string(text)?
+        );
+        let selector = selector.to_string();
+        let text = text.to_string();
+        let mut s = take_session()?;
+        let result = async {
+            let resp = cdp_call(
+                &mut s.ws,
+                "Runtime.evaluate",
+                json!({ "expression": js, "returnByValue": true }),
+            )
+            .await?;
+            let ok = resp["result"]["result"]["value"].as_bool().unwrap_or(false);
+            if ok {
+                Ok(format!("Filled '{}' with {:?}", selector, text))
+            } else {
+                Err(anyhow::anyhow!(
+                    "No element found for selector: {}",
+                    selector
+                ))
+            }
+        }
+        .await;
+        store_session(s);
+        result
+    }
+
+    /// Evaluate arbitrary JavaScript and return the result as a string.
+    pub async fn eval(js: &str) -> anyhow::Result<String> {
+        let js = js.to_string();
+        let mut s = take_session()?;
+        let result = async {
+            let resp = cdp_call(
+                &mut s.ws,
+                "Runtime.evaluate",
+                json!({ "expression": js, "returnByValue": true }),
+            )
+            .await?;
+            let result_val = &resp["result"]["result"];
+            let out = if let Some(v) = result_val["value"].as_str() {
+                v.to_string()
+            } else if !result_val["value"].is_null() {
+                result_val["value"].to_string()
+            } else if let Some(desc) = result_val["description"].as_str() {
+                desc.to_string()
+            } else {
+                result_val.to_string()
+            };
+            Ok(out)
+        }
+        .await;
+        store_session(s);
+        result
+    }
+
+}
+
+// ---- SlashCommand impl -------------------------------------------------------
 
 #[async_trait]
 impl SlashCommand for ChromeCommand {
     fn name(&self) -> &str { "chrome" }
-    fn description(&self) -> &str { "Chrome DevTools integration — connect Claude to a browser tab" }
+    fn description(&self) -> &str {
+        "Browser automation via Chrome DevTools Protocol (CDP)"
+    }
     fn help(&self) -> &str {
-        "Usage: /chrome [url]\n\n\
-         Integrates Claude Code with Google Chrome via the Chrome DevTools Protocol (CDP).\n\n\
-         To use:\n\
-         1. Launch Chrome with remote debugging:\n\
-            chrome --remote-debugging-port=9222\n\
-         2. Run /chrome to connect\n\
-         3. Claude can then read the DOM, console logs, network requests, etc.\n\n\
-         Optional: /chrome <url>  — navigate to a URL after connecting"
+        "Usage: /chrome <subcommand> [args]\n\n\
+         Control a running Chrome/Chromium browser via CDP.\n\n\
+         First, launch Chrome with remote debugging enabled:\n\
+           chrome --remote-debugging-port=9222 --no-first-run\n\n\
+         Subcommands:\n\
+           /chrome connect [--port 9222]      — connect to Chrome\n\
+           /chrome navigate <url>             — navigate to URL\n\
+           /chrome screenshot                 — take screenshot, save to temp file\n\
+           /chrome click <selector>           — click CSS selector\n\
+           /chrome fill <selector> <text>     — fill input field\n\
+           /chrome eval <js>                  — evaluate JavaScript\n\
+           /chrome disconnect                 — disconnect"
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let cdp_url = "http://localhost:9222";
+        let mut parts = args.trim().splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").trim();
+        let rest = parts.next().unwrap_or("").trim();
 
-        // Try to reach the Chrome debugging endpoint
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap_or_default();
+        match sub {
+            // ------------------------------------------------------------------
+            // /chrome connect [--port <N>]
+            // ------------------------------------------------------------------
+            "connect" => {
+                let port: u16 = if let Some(p) = rest.strip_prefix("--port ").map(str::trim) {
+                    match p.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            return CommandResult::Error(format!(
+                                "Invalid port number: {}",
+                                p
+                            ));
+                        }
+                    }
+                } else if rest.is_empty() {
+                    9222
+                } else {
+                    match rest.parse() {
+                        Ok(n) => n,
+                        Err(_) => {
+                            return CommandResult::Error(format!(
+                                "Usage: /chrome connect [--port <N>]\nInvalid argument: {}",
+                                rest
+                            ));
+                        }
+                    }
+                };
 
-        let chrome_available = client
-            .get(format!("{}/json/version", cdp_url))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
+                match chrome_cdp::connect(port).await {
+                    Ok(msg) => CommandResult::Message(msg),
+                    Err(e) => CommandResult::Error(format!(
+                        "Failed to connect to Chrome on port {}: {}\n\n\
+                         Make sure Chrome is running with:\n\
+                           chrome --remote-debugging-port={} --no-first-run",
+                        port, e, port
+                    )),
+                }
+            }
 
-        if chrome_available {
-            let navigate_msg = if !args.trim().is_empty() {
-                format!("\n\nNavigating to: {}", args.trim())
-            } else {
-                String::new()
-            };
-            CommandResult::Message(format!(
-                "Chrome DevTools connected at {cdp_url}{nav}\n\n\
-                 Claude can now access the browser context. Try asking:\n\
-                 - 'What's on the current page?'\n\
-                 - 'Check the browser console for errors'\n\
-                 - 'Describe the page structure'",
-                cdp_url = cdp_url,
-                nav = navigate_msg,
-            ))
-        } else {
-            CommandResult::Message(format!(
-                "Chrome DevTools not found at {cdp_url}\n\n\
-                 To enable Chrome integration:\n\
-                 1. Close Chrome completely\n\
-                 2. Relaunch with debugging enabled:\n\n\
-                    macOS:   /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome \\\n\
-                             --remote-debugging-port=9222 --no-first-run\n\
-                    Windows: chrome.exe --remote-debugging-port=9222 --no-first-run\n\
-                    Linux:   google-chrome --remote-debugging-port=9222 --no-first-run\n\n\
-                 3. Then run /chrome again\n\n\
-                 Note: Do not use your primary Chrome profile for security reasons.\n\
-                 Docs: https://docs.anthropic.com/claude-code/chrome-devtools",
-                cdp_url = cdp_url,
-            ))
+            // ------------------------------------------------------------------
+            // /chrome navigate <url>
+            // ------------------------------------------------------------------
+            "navigate" => {
+                if rest.is_empty() {
+                    return CommandResult::Error(
+                        "Usage: /chrome navigate <url>\nExample: /chrome navigate https://example.com"
+                            .to_string(),
+                    );
+                }
+                match chrome_cdp::navigate(rest).await {
+                    Ok(msg) => CommandResult::Message(msg),
+                    Err(e) => CommandResult::Error(e.to_string()),
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // /chrome screenshot
+            // ------------------------------------------------------------------
+            "screenshot" => match chrome_cdp::screenshot().await {
+                Ok(msg) => CommandResult::Message(msg),
+                Err(e) => CommandResult::Error(e.to_string()),
+            },
+
+            // ------------------------------------------------------------------
+            // /chrome click <selector>
+            // ------------------------------------------------------------------
+            "click" => {
+                if rest.is_empty() {
+                    return CommandResult::Error(
+                        "Usage: /chrome click <css-selector>\nExample: /chrome click button#submit"
+                            .to_string(),
+                    );
+                }
+                match chrome_cdp::click(rest).await {
+                    Ok(msg) => CommandResult::Message(msg),
+                    Err(e) => CommandResult::Error(e.to_string()),
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // /chrome fill <selector> <text>
+            // ------------------------------------------------------------------
+            "fill" => {
+                // Split selector and text at first whitespace.
+                let mut fill_parts = rest.splitn(2, char::is_whitespace);
+                let selector = fill_parts.next().unwrap_or("").trim();
+                let text = fill_parts.next().unwrap_or("").trim();
+                if selector.is_empty() {
+                    return CommandResult::Error(
+                        "Usage: /chrome fill <css-selector> <text>\nExample: /chrome fill input#email user@example.com"
+                            .to_string(),
+                    );
+                }
+                match chrome_cdp::fill(selector, text).await {
+                    Ok(msg) => CommandResult::Message(msg),
+                    Err(e) => CommandResult::Error(e.to_string()),
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // /chrome eval <js>
+            // ------------------------------------------------------------------
+            "eval" => {
+                if rest.is_empty() {
+                    return CommandResult::Error(
+                        "Usage: /chrome eval <javascript>\nExample: /chrome eval document.title"
+                            .to_string(),
+                    );
+                }
+                match chrome_cdp::eval(rest).await {
+                    Ok(result) => CommandResult::Message(format!("=> {}", result)),
+                    Err(e) => CommandResult::Error(e.to_string()),
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // /chrome disconnect
+            // ------------------------------------------------------------------
+            "disconnect" => CommandResult::Message(chrome_cdp::disconnect()),
+
+            // ------------------------------------------------------------------
+            // No subcommand or unknown
+            // ------------------------------------------------------------------
+            "" => CommandResult::Message(self.help().to_string()),
+            other => CommandResult::Error(format!(
+                "Unknown subcommand: '{}'\n\n{}",
+                other,
+                self.help()
+            )),
         }
     }
 }
@@ -3660,7 +5311,7 @@ impl SlashCommand for VimCommand {
         "Usage: /vim [on|off]\n\n\
          Toggles vim keybinding mode in the REPL input.\n\
          When enabled, use Esc to switch between INSERT and NORMAL modes.\n\n\
-         The setting is persisted to ~/.claude/ui-settings.json."
+         The setting is persisted to ~/.claurst/ui-settings.json."
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -3709,7 +5360,7 @@ impl SlashCommand for VoiceCommand {
         "Usage: /voice [on|off]\n\n\
          Enables or disables voice input (hold-to-talk).\n\
          Voice requires a Claude.ai subscription with the voice scope enabled.\n\
-         Setting is persisted to ~/.claude/ui-settings.json."
+         Setting is persisted to ~/.claurst/ui-settings.json."
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -3752,20 +5403,21 @@ impl SlashCommand for VoiceCommand {
 
 #[async_trait]
 impl SlashCommand for UpgradeCommand {
-    fn name(&self) -> &str { "upgrade" }
-    fn description(&self) -> &str { "Check for updates and show upgrade options" }
+    fn name(&self) -> &str { "update" }
+    fn aliases(&self) -> Vec<&str> { vec!["upgrade"] }
+    fn description(&self) -> &str { "Check for updates and download the latest release" }
     fn help(&self) -> &str {
-        "Usage: /upgrade\n\n\
-         Checks GitHub releases for the latest version of Claude Code.\n\
-         If a newer version is available, shows the upgrade command."
+        "Usage: /update\n\n\
+         Checks GitHub releases for the latest version of Claurst.\n\
+         If a newer version is available, shows where to download it."
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let current = cc_core::constants::APP_VERSION;
+        let current = claurst_core::constants::APP_VERSION;
 
         // Check GitHub releases API for latest version
         let client = reqwest::Client::builder()
-            .user_agent(format!("claude-code-rust/{}", current))
+            .user_agent(format!("claurst/{}", current))
             .timeout(std::time::Duration::from_secs(8))
             .build();
 
@@ -3775,13 +5427,13 @@ impl SlashCommand for UpgradeCommand {
                 return CommandResult::Message(format!(
                     "Current version: {current}\n\
                      Could not check for updates (HTTP client error: {e})\n\
-                     Visit https://github.com/anthropics/claude-code/releases for updates."
+                     Visit https://github.com/kuberwastaken/claurst/releases for updates."
                 ))
             }
         };
 
         let resp = client
-            .get("https://api.github.com/repos/anthropics/claude-code/releases/latest")
+            .get("https://api.github.com/repos/kuberwastaken/claurst/releases/latest")
             .send()
             .await;
 
@@ -3799,11 +5451,11 @@ impl SlashCommand for UpgradeCommand {
                 let url = json
                     .get("html_url")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("https://github.com/anthropics/claude-code/releases");
+                    .unwrap_or("https://github.com/kuberwastaken/claurst/releases");
 
                 if tag == current || tag == "unknown" {
                     CommandResult::Message(format!(
-                        "Claude Code v{current} — you are up to date.\n\
+                        "Claurst v{current} — you are up to date.\n\
                          Release page: {url}"
                     ))
                 } else {
@@ -3812,10 +5464,10 @@ impl SlashCommand for UpgradeCommand {
                          Current version:  v{current}\n\
                          Latest version:   v{tag}\n\
                          Release page:     {url}\n\n\
-                         To upgrade (npm):\n\
-                           npm install -g @anthropic-ai/claude-code@latest\n\n\
-                         To upgrade (cargo):\n\
-                           cargo install claude-code --force"
+                         Download the latest release:\n\
+                           {url}\n\n\
+                         Or build from source:\n\
+                           cargo install claurst --force"
                     ))
                 }
             }
@@ -3824,13 +5476,13 @@ impl SlashCommand for UpgradeCommand {
                 CommandResult::Message(format!(
                     "Current version: v{current}\n\
                      Could not check for updates (HTTP {status}).\n\
-                     Visit https://github.com/anthropics/claude-code/releases for updates."
+                     Visit https://github.com/kuberwastaken/claurst/releases for updates."
                 ))
             }
             Err(e) => CommandResult::Message(format!(
                 "Current version: v{current}\n\
                  Could not check for updates: {e}\n\
-                 Visit https://github.com/anthropics/claude-code/releases for updates."
+                 Visit https://github.com/kuberwastaken/claurst/releases for updates."
             )),
         }
     }
@@ -3849,7 +5501,7 @@ impl SlashCommand for ReleaseNotesCommand {
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let current = cc_core::constants::APP_VERSION;
+        let current = claurst_core::constants::APP_VERSION;
         let version = args.trim();
 
         let tag = if version.is_empty() {
@@ -3861,7 +5513,7 @@ impl SlashCommand for ReleaseNotesCommand {
         };
 
         let client = reqwest::Client::builder()
-            .user_agent(format!("claude-code-rust/{}", current))
+            .user_agent(format!("claurst/{}", current))
             .timeout(std::time::Duration::from_secs(8))
             .build();
 
@@ -3869,14 +5521,14 @@ impl SlashCommand for ReleaseNotesCommand {
             Ok(c) => c,
             Err(_) => {
                 return CommandResult::Message(format!(
-                    "Claude Code {tag} release notes:\n\
-                     Visit https://github.com/anthropics/claude-code/releases/tag/{tag}"
+                    "Claurst {tag} release notes:\n\
+                     Visit https://github.com/kuberwastaken/claurst/releases/tag/{tag}"
                 ))
             }
         };
 
         let url = format!(
-            "https://api.github.com/repos/anthropics/claude-code/releases/tags/{}",
+            "https://api.github.com/repos/kuberwastaken/claurst/releases/tags/{}",
             tag
         );
 
@@ -3901,7 +5553,7 @@ impl SlashCommand for ReleaseNotesCommand {
                     .unwrap_or("");
 
                 CommandResult::Message(format!(
-                    "Release Notes: Claude Code {tag}\n\
+                    "Release Notes: Claurst {tag}\n\
                      Published: {published}\n\
                      URL: {html_url}\n\
                      ─────────────────────────────────\n\
@@ -3910,17 +5562,17 @@ impl SlashCommand for ReleaseNotesCommand {
             }
             Ok(r) if r.status().as_u16() == 404 => CommandResult::Message(format!(
                 "No release found for {tag}.\n\
-                 View all releases: https://github.com/anthropics/claude-code/releases"
+                 View all releases: https://github.com/kuberwastaken/claurst/releases"
             )),
             Ok(r) => CommandResult::Message(format!(
                 "Could not fetch release notes (HTTP {}).\n\
-                 View at: https://github.com/anthropics/claude-code/releases/tag/{}",
+                 View at: https://github.com/kuberwastaken/claurst/releases/tag/{}",
                 r.status(),
                 tag
             )),
             Err(e) => CommandResult::Message(format!(
                 "Could not fetch release notes: {e}\n\
-                 View at: https://github.com/anthropics/claude-code/releases/tag/{tag}"
+                 View at: https://github.com/kuberwastaken/claurst/releases/tag/{tag}"
             )),
         }
     }
@@ -3935,12 +5587,12 @@ impl SlashCommand for RateLimitOptionsCommand {
     fn help(&self) -> &str {
         "Usage: /rate-limit-options\n\n\
          Displays available rate limit tiers and the current tier for your account.\n\
-         Rate limits depend on your Claude plan (Free, Pro, Max, API)."
+         Rate limits depend on your Claurst plan (Free, Pro, Max, API)."
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         // Try to read from OAuth tokens file to get subscription/tier info
-        let tier_info = match cc_core::oauth::OAuthTokens::load().await {
+        let tier_info = match claurst_core::oauth::OAuthTokens::load().await {
             Some(tokens) => {
                 let sub_type = tokens.subscription_type.as_deref().unwrap_or("unknown");
                 format!(
@@ -3990,7 +5642,7 @@ impl SlashCommand for StatuslineCommand {
     fn help(&self) -> &str {
         "Usage: /statusline [show|hide] [cost|tokens|model|time|all]\n\n\
          Controls which items appear in the TUI status bar at the bottom.\n\
-         Settings are persisted to ~/.claude/ui-settings.json.\n\n\
+         Settings are persisted to ~/.claurst/ui-settings.json.\n\n\
          Examples:\n\
            /statusline               — show current configuration\n\
            /statusline show cost     — show cost in status line\n\
@@ -4084,7 +5736,7 @@ impl SlashCommand for SecurityReviewCommand {
     fn description(&self) -> &str { "Run a security review of the current project" }
     fn help(&self) -> &str {
         "Usage: /security-review [path]\n\n\
-         Asks Claude to perform a security review of the codebase.\n\
+         Asks Claurst to perform a security review of the codebase.\n\
          Analyzes for common vulnerabilities: injection attacks, auth issues,\n\
          secrets exposure, unsafe deserialization, path traversal, etc."
     }
@@ -4126,11 +5778,11 @@ impl SlashCommand for SecurityReviewCommand {
 #[async_trait]
 impl SlashCommand for TerminalSetupCommand {
     fn name(&self) -> &str { "terminal-setup" }
-    fn description(&self) -> &str { "Help configure your terminal for optimal Claude Code use" }
+    fn description(&self) -> &str { "Help configure your terminal for optimal Claurst use" }
     fn help(&self) -> &str {
         "Usage: /terminal-setup\n\n\
          Diagnoses your terminal environment and gives recommendations for\n\
-         optimal Claude Code display (font, color support, Unicode, etc.)."
+         optimal Claurst display (font, color support, Unicode, etc.)."
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -4194,7 +5846,7 @@ impl SlashCommand for TerminalSetupCommand {
             "Terminal Setup Diagnostic\n\
              ─────────────────────────\n\
              {checks}\n\n\
-             Recommendations for optimal Claude Code experience:\n\
+             Recommendations for optimal Claurst experience:\n\
              ─────────────────────────────────────────────────\n\
              1. Font: Use a Nerd Font for box-drawing characters and icons\n\
                 {nerd_hint}\n\
@@ -4245,7 +5897,7 @@ impl SlashCommand for ExtraUsageCommand {
 
         // Estimate API calls from messages (each assistant message ~ 1 API call)
         let api_calls = ctx.messages.iter()
-            .filter(|m| m.role == cc_core::types::Role::Assistant)
+            .filter(|m| m.role == claurst_core::types::Role::Assistant)
             .count();
         let api_calls = api_calls.max(1); // at least 1 if we have any data
 
@@ -4320,7 +5972,7 @@ impl SlashCommand for AdvisorCommand {
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let arg = args.trim();
-        let settings_dir = cc_core::config::Settings::config_dir();
+        let settings_dir = claurst_core::config::Settings::config_dir();
         let settings_path = settings_dir.join("settings.json");
 
         // Read or create settings JSON
@@ -4372,24 +6024,24 @@ impl SlashCommand for AdvisorCommand {
 #[async_trait]
 impl SlashCommand for InstallSlackAppCommand {
     fn name(&self) -> &str { "install-slack-app" }
-    fn description(&self) -> &str { "Install the Claude Code Slack integration" }
+    fn description(&self) -> &str { "Install the Claurst Slack integration" }
     fn help(&self) -> &str {
         "Usage: /install-slack-app\n\n\
-         Opens instructions for installing the Claude Code Slack app.\n\
-         Requires a Claude for Enterprise subscription."
+         Opens instructions for installing the Claurst Slack app.\n\
+         Requires a Claurst for Enterprise subscription."
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::Message(
-            "Claude Code Slack Integration\n\
+            "Claurst Slack Integration\n\
              ─────────────────────────────\n\
-             To install Claude Code in Slack:\n\n\
-             1. Ensure you have a Claude for Enterprise subscription\n\
+             To install Claurst in Slack:\n\n\
+             1. Ensure you have a Claurst for Enterprise subscription\n\
              2. Visit your Anthropic Console → Integrations → Slack\n\
              3. Click \"Add to Slack\" and authorize the app\n\
-             4. Invite @Claude to any channel with: /invite @Claude\n\n\
+             4. Invite @Claurst to any channel with: /invite @Claurst\n\n\
              In Slack, you can then:\n\
-             • Mention @Claude to ask questions in any channel\n\
+             • Mention @Claurst to ask questions in any channel\n\
              • Use /claude for direct commands\n\
              • Share code snippets for review\n\n\
              See: https://docs.anthropic.com/claude-code/slack"
@@ -4409,7 +6061,7 @@ impl SlashCommand for FastCommand {
         "Usage: /fast [on|off]\n\n\
          Fast mode switches to a faster, more economical model variant\n\
          (claude-haiku) for quick responses. Toggle without argument to switch.\n\
-         The setting is persisted to ~/.claude/ui-settings.json."
+         The setting is persisted to ~/.claurst/ui-settings.json."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -4434,7 +6086,7 @@ impl SlashCommand for FastCommand {
 
         let fast_model = "claude-haiku-4-5";
         let normal_model = ctx.config.model.as_deref()
-            .unwrap_or(cc_core::constants::DEFAULT_MODEL);
+            .unwrap_or(claurst_core::constants::DEFAULT_MODEL);
 
         if enable {
             let mut new_config = ctx.config.clone();
@@ -4455,7 +6107,7 @@ impl SlashCommand for FastCommand {
                 new_config,
                 format!(
                     "Fast mode OFF. Restored to default model ({}).",
-                    cc_core::constants::DEFAULT_MODEL
+                    claurst_core::constants::DEFAULT_MODEL
                 ),
             )
         }
@@ -4483,7 +6135,7 @@ impl SlashCommand for ThinkBackCommand {
             .messages
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.role == cc_core::types::Role::Assistant)
+            .filter(|(_, m)| m.role == claurst_core::types::Role::Assistant)
             .filter_map(|(idx, m)| {
                 let blocks = m.get_thinking_blocks();
                 if blocks.is_empty() {
@@ -4492,7 +6144,7 @@ impl SlashCommand for ThinkBackCommand {
                 let thinking: String = blocks
                     .iter()
                     .filter_map(|b| {
-                        if let cc_core::types::ContentBlock::Thinking { thinking, .. } = b {
+                        if let claurst_core::types::ContentBlock::Thinking { thinking, .. } = b {
                             Some(thinking.as_str())
                         } else {
                             None
@@ -4508,7 +6160,7 @@ impl SlashCommand for ThinkBackCommand {
             return CommandResult::Message(
                 "No thinking traces found in this session.\n\
                  Thinking traces appear when the model uses extended thinking mode.\n\
-                 Try asking Claude to 'think step by step' or 'think carefully'."
+                 Try asking Claurst to 'think step by step' or 'think carefully'."
                     .to_string(),
             );
         }
@@ -4550,7 +6202,7 @@ impl SlashCommand for ThinkBackPlayCommand {
         let thinking_blocks: Vec<String> = ctx
             .messages
             .iter()
-            .filter(|m| m.role == cc_core::types::Role::Assistant)
+            .filter(|m| m.role == claurst_core::types::Role::Assistant)
             .filter_map(|m| {
                 let blocks = m.get_thinking_blocks();
                 if blocks.is_empty() {
@@ -4559,7 +6211,7 @@ impl SlashCommand for ThinkBackPlayCommand {
                 let t: String = blocks
                     .iter()
                     .filter_map(|b| {
-                        if let cc_core::types::ContentBlock::Thinking { thinking, .. } = b {
+                        if let claurst_core::types::ContentBlock::Thinking { thinking, .. } = b {
                             Some(thinking.as_str())
                         } else {
                             None
@@ -4690,6 +6342,81 @@ impl SlashCommand for ColorSetCommand {
     }
 }
 
+// ---- /search -------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for SearchCommand {
+    fn name(&self) -> &str { "search" }
+    fn description(&self) -> &str { "Search across all sessions" }
+    fn help(&self) -> &str {
+        "Usage: /search <query>\n\n\
+         Searches session titles and message content in the local SQLite\n\
+         session database (~/.claurst/sessions.db).  Returns the 50 best\n\
+         matching sessions, ordered by most recently updated.\n\n\
+         Example: /search refactor authentication"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let query = args.trim();
+        if query.is_empty() {
+            return CommandResult::Error(
+                "Usage: /search <query>\n\
+                 Provide a search term to look up across all sessions."
+                    .to_string(),
+            );
+        }
+
+        let db_path = claurst_core::config::Settings::config_dir().join("sessions.db");
+
+        let store = match claurst_core::SqliteSessionStore::open(&db_path) {
+            Ok(s) => s,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Failed to open session database: {}\n\
+                     The database is created automatically once sessions are stored.",
+                    e
+                ))
+            }
+        };
+
+        let results = match store.search_sessions(query) {
+            Ok(r) => r,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Search failed: {}",
+                    e
+                ))
+            }
+        };
+
+        if results.is_empty() {
+            return CommandResult::Message(format!(
+                "No sessions found matching \"{}\".",
+                query
+            ));
+        }
+
+        let mut out = format!(
+            "Search results for \"{}\": {} session(s)\n\n",
+            query,
+            results.len()
+        );
+        for s in &results {
+            let title = s.title.as_deref().unwrap_or("(untitled)");
+            out.push_str(&format!(
+                "  [{}] {} — {} ({} messages, updated {})\n",
+                &s.id[..s.id.len().min(12)],
+                title,
+                s.model,
+                s.message_count,
+                &s.updated_at[..s.updated_at.len().min(10)],
+            ));
+        }
+        out.push_str("\nTip: use /resume <session-id> to continue a session.");
+        CommandResult::Message(out)
+    }
+}
+
 // ---- /share --------------------------------------------------------------
 
 #[async_trait]
@@ -4813,36 +6540,397 @@ impl SlashCommand for ShareCommand {
 
 // ---- /teleport -----------------------------------------------------------
 
+/// Serialisable bundle written to / read from a `.teleport` file.
+mod teleport_bundle {
+    use claurst_core::permissions::{PermissionAction, SerializedPermissionRule};
+    use claurst_core::types::Message;
+    use serde::{Deserialize, Serialize};
+
+    pub const BUNDLE_VERSION: &str = "1";
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct TeleportBundle {
+        /// Always `"1"`.
+        pub version: String,
+        pub session_id: String,
+        pub messages: Vec<Message>,
+        pub working_dir: String,
+        pub permissions: TeleportPermissions,
+        pub model: Option<String>,
+        pub effort: Option<String>,
+        /// Recently accessed file paths extracted from tool-use blocks.
+        pub files: Vec<String>,
+        /// Environment variables — ANTHROPIC_API_KEY is excluded for security.
+        pub env: std::collections::HashMap<String, String>,
+        pub exported_at: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct TeleportPermissions {
+        pub allowed: Vec<String>,
+        pub denied: Vec<String>,
+        pub rules: Vec<SerializedPermissionRule>,
+    }
+
+    impl TeleportPermissions {
+        #[allow(dead_code)]
+        pub fn from_rules(rules: &[SerializedPermissionRule]) -> Self {
+            let mut allowed = Vec::new();
+            let mut denied = Vec::new();
+            for r in rules {
+                let name = r.tool_name.clone().unwrap_or_else(|| "*".to_string());
+                match r.action {
+                    PermissionAction::Allow => allowed.push(name),
+                    PermissionAction::Deny => denied.push(name),
+                }
+            }
+            TeleportPermissions {
+                allowed,
+                denied,
+                rules: rules.to_vec(),
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl SlashCommand for TeleportCommand {
     fn name(&self) -> &str { "teleport" }
-    fn description(&self) -> &str { "Teleport to a different session or branch point" }
+    fn description(&self) -> &str { "Export/import/link session context as a portable bundle" }
     fn help(&self) -> &str {
-        "Usage: /teleport\n\n\
-         Teleports to a remote session when a bridge connection is active.\n\n\
-         When connected to a remote session (via /remote-control), this command\n\
-         jumps to the latest state of that remote session.\n\n\
-         For local-only sessions: shows the current session ID and explains\n\
-         that a bridge connection is required."
+        "Usage:\n\
+         \n\
+         /teleport export [--output <file>]\n\
+         \x20 Serialize the current session to a .teleport JSON bundle.\n\
+         \x20 Defaults to ~/.claurst/teleport_<session_id>.json\n\
+         \n\
+         /teleport import <file>\n\
+         \x20 Load a .teleport bundle and restore messages, working dir, and\n\
+         \x20 tool permissions into the current session.\n\
+         \n\
+         /teleport link\n\
+         \x20 Generate a teleport:// deep link (base64-encoded bundle) for sharing."
     }
 
-    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        if let Some(ref remote_url) = ctx.remote_session_url {
-            CommandResult::Message(format!(
-                "Teleporting to remote session...\n\
-                 Remote URL: {}\n\
-                 Session ID: {}\n\n\
-                 Use your browser or the claude.ai app to continue from this point.",
-                remote_url, ctx.session_id
-            ))
-        } else {
-            CommandResult::Message(format!(
-                "Teleport requires an active remote session bridge.\n\
-                 Use /session to view connection info.\n\n\
-                 Current session ID: {}\n\
-                 To enable bridge: /remote-control start",
-                ctx.session_id
-            ))
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        use teleport_bundle::{TeleportBundle, TeleportPermissions, BUNDLE_VERSION};
+
+        let args = args.trim();
+
+        // Dispatch on first token.
+        let (sub, rest) = match args.split_once(|c: char| c.is_whitespace()) {
+            Some((s, r)) => (s, r.trim()),
+            None => (args, ""),
+        };
+
+        match sub {
+            "export" => {
+                // ---- determine output path --------------------------------
+                let output_path: std::path::PathBuf = {
+                    // Parse --output <file>
+                    let explicit = if let Some(stripped) = rest.strip_prefix("--output") {
+                        let path_str = stripped.trim();
+                        if !path_str.is_empty() {
+                            Some(std::path::PathBuf::from(path_str))
+                        } else {
+                            None
+                        }
+                    } else if !rest.is_empty() {
+                        // Bare path without --output flag is also accepted.
+                        Some(std::path::PathBuf::from(rest))
+                    } else {
+                        None
+                    };
+
+                    if let Some(p) = explicit {
+                        p
+                    } else {
+                        // Default: ~/.claurst/teleport_<session_id>.json
+                        let base = dirs::home_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join(".claurst");
+                        let _ = std::fs::create_dir_all(&base);
+                        base.join(format!("teleport_{}.json", ctx.session_id))
+                    }
+                };
+
+                // ---- collect recently accessed file paths from messages ----
+                let files: Vec<String> = {
+                    use claurst_core::types::{ContentBlock, MessageContent};
+                    let mut seen: Vec<String> = Vec::new();
+                    for msg in &ctx.messages {
+                        if let MessageContent::Blocks(blocks) = &msg.content {
+                            for block in blocks {
+                                match block {
+                                    ContentBlock::ToolUse { input, .. } => {
+                                        // Read/Write/Edit/Glob/Grep all take a
+                                        // "path" or "file_path" argument.
+                                        let candidates = ["path", "file_path", "filePath"];
+                                        for key in &candidates {
+                                            if let Some(v) = input.get(key) {
+                                                if let Some(s) = v.as_str() {
+                                                    if !s.is_empty() && !seen.contains(&s.to_string()) {
+                                                        seen.push(s.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ContentBlock::CollapsedReadSearch { paths, .. } => {
+                                        for p in paths {
+                                            if !seen.contains(p) {
+                                                seen.push(p.clone());
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    seen.into_iter().take(50).collect()
+                };
+
+                // ---- collect env vars (exclude ANTHROPIC_API_KEY) ----------
+                let env: std::collections::HashMap<String, String> = std::env::vars()
+                    .filter(|(k, _)| k != "ANTHROPIC_API_KEY")
+                    .collect();
+
+                // ---- build permissions snapshot from config ----------------
+                // The config holds allowed_tools / disallowed_tools as plain
+                // tool-name strings; we also pull any serialized permission rules
+                // from the settings if accessible.
+                let permissions = {
+                    let allowed: Vec<String> = ctx.config.allowed_tools.clone();
+                    let denied: Vec<String> = ctx.config.disallowed_tools.clone();
+                    // Build minimal SerializedPermissionRule list from config lists.
+                    let mut rules = Vec::new();
+                    use claurst_core::permissions::{PermissionAction, SerializedPermissionRule};
+                    for name in &allowed {
+                        rules.push(SerializedPermissionRule {
+                            tool_name: Some(name.clone()),
+                            path_pattern: None,
+                            action: PermissionAction::Allow,
+                        });
+                    }
+                    for name in &denied {
+                        rules.push(SerializedPermissionRule {
+                            tool_name: Some(name.clone()),
+                            path_pattern: None,
+                            action: PermissionAction::Deny,
+                        });
+                    }
+                    TeleportPermissions { allowed, denied, rules }
+                };
+
+                // ---- build bundle -----------------------------------------
+                let bundle = TeleportBundle {
+                    version: BUNDLE_VERSION.to_string(),
+                    session_id: ctx.session_id.clone(),
+                    messages: ctx.messages.clone(),
+                    working_dir: ctx.working_dir.to_string_lossy().into_owned(),
+                    permissions,
+                    model: ctx.config.model.clone(),
+                    effort: None, // EffortLevel not stored in CommandContext directly
+                    files,
+                    env,
+                    exported_at: chrono::Utc::now().to_rfc3339(),
+                };
+
+                // ---- serialize and write ----------------------------------
+                let json = match serde_json::to_string_pretty(&bundle) {
+                    Ok(j) => j,
+                    Err(e) => return CommandResult::Error(format!("Failed to serialize bundle: {}", e)),
+                };
+
+                if let Err(e) = std::fs::write(&output_path, &json) {
+                    return CommandResult::Error(format!(
+                        "Failed to write teleport bundle to {}: {}",
+                        output_path.display(),
+                        e
+                    ));
+                }
+
+                CommandResult::Message(format!(
+                    "Teleport bundle exported.\n\
+                     File:     {}\n\
+                     Session:  {}\n\
+                     Messages: {}\n\
+                     Files:    {}\n\
+                     Model:    {}\n\
+                     Time:     {}",
+                    output_path.display(),
+                    bundle.session_id,
+                    bundle.messages.len(),
+                    bundle.files.len(),
+                    bundle.model.as_deref().unwrap_or("(default)"),
+                    bundle.exported_at,
+                ))
+            }
+
+            "import" => {
+                if rest.is_empty() {
+                    return CommandResult::Error(
+                        "Usage: /teleport import <file>".to_string(),
+                    );
+                }
+
+                let path = std::path::PathBuf::from(rest);
+
+                let data = match std::fs::read_to_string(&path) {
+                    Ok(s) => s,
+                    Err(e) => return CommandResult::Error(format!(
+                        "Cannot read teleport bundle '{}': {}",
+                        path.display(),
+                        e
+                    )),
+                };
+
+                let bundle: TeleportBundle = match serde_json::from_str(&data) {
+                    Ok(b) => b,
+                    Err(e) => return CommandResult::Error(format!(
+                        "Failed to parse teleport bundle: {}",
+                        e
+                    )),
+                };
+
+                // ---- validate version ------------------------------------
+                if bundle.version != BUNDLE_VERSION {
+                    return CommandResult::Error(format!(
+                        "Unsupported teleport bundle version '{}' (expected '{}').",
+                        bundle.version, BUNDLE_VERSION
+                    ));
+                }
+
+                // ---- restore working directory ---------------------------
+                let restored_dir = std::path::PathBuf::from(&bundle.working_dir);
+                if restored_dir.exists() {
+                    ctx.working_dir = restored_dir.clone();
+                    let _ = std::env::set_current_dir(&restored_dir);
+                }
+
+                // ---- restore tool permissions ----------------------------
+                let mut new_config = ctx.config.clone();
+                new_config.allowed_tools = bundle.permissions.allowed.clone();
+                new_config.disallowed_tools = bundle.permissions.denied.clone();
+                if let Some(ref model) = bundle.model {
+                    new_config.model = Some(model.clone());
+                }
+                ctx.config = new_config.clone();
+
+                // ---- restore messages ------------------------------------
+                // Capture summary fields before moving bundle.messages.
+                let msg_count = bundle.messages.len();
+                let files_count = bundle.files.len();
+                let working_dir_display = bundle.working_dir.clone();
+                let session_id = bundle.session_id.clone();
+                let exported_at = bundle.exported_at.clone();
+                let allowed_count = bundle.permissions.allowed.len();
+                let denied_count = bundle.permissions.denied.len();
+                let dir_restored = restored_dir.exists();
+
+                // Directly replace messages in the live context; the caller's
+                // REPL will see the updated ctx.messages on the next turn.
+                ctx.messages = bundle.messages;
+
+                CommandResult::Message(format!(
+                    "Teleport bundle imported.\n\
+                     Source session: {}\n\
+                     Exported at:    {}\n\
+                     Messages:       {} restored\n\
+                     Working dir:    {}{}\n\
+                     Permissions:    {} allowed, {} denied\n\
+                     Files tracked:  {}",
+                    session_id,
+                    exported_at,
+                    msg_count,
+                    working_dir_display,
+                    if dir_restored { " (restored)" } else { " (path not found, skipped)" },
+                    allowed_count,
+                    denied_count,
+                    files_count,
+                ))
+            }
+
+            "link" => {
+                // ---- build a minimal bundle for the link (no env vars) ---
+                use teleport_bundle::TeleportBundle;
+                use base64::Engine as _;
+
+                let permissions = {
+                    let allowed = ctx.config.allowed_tools.clone();
+                    let denied = ctx.config.disallowed_tools.clone();
+                    use claurst_core::permissions::{PermissionAction, SerializedPermissionRule};
+                    let mut rules = Vec::new();
+                    for name in &allowed {
+                        rules.push(SerializedPermissionRule {
+                            tool_name: Some(name.clone()),
+                            path_pattern: None,
+                            action: PermissionAction::Allow,
+                        });
+                    }
+                    for name in &denied {
+                        rules.push(SerializedPermissionRule {
+                            tool_name: Some(name.clone()),
+                            path_pattern: None,
+                            action: PermissionAction::Deny,
+                        });
+                    }
+                    TeleportPermissions { allowed, denied, rules }
+                };
+
+                let bundle = TeleportBundle {
+                    version: BUNDLE_VERSION.to_string(),
+                    session_id: ctx.session_id.clone(),
+                    messages: ctx.messages.clone(),
+                    working_dir: ctx.working_dir.to_string_lossy().into_owned(),
+                    permissions,
+                    model: ctx.config.model.clone(),
+                    effort: None,
+                    files: Vec::new(), // keep link compact
+                    env: std::collections::HashMap::new(), // omit env for security
+                    exported_at: chrono::Utc::now().to_rfc3339(),
+                };
+
+                let json = match serde_json::to_string(&bundle) {
+                    Ok(j) => j,
+                    Err(e) => return CommandResult::Error(format!("Failed to serialize bundle: {}", e)),
+                };
+
+                let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
+                let link = format!("teleport://{}", encoded);
+
+                // Warn if the link is very long.
+                let size_hint = if link.len() > 8192 {
+                    format!("\n(Link is {} bytes — consider /teleport export for large sessions)", link.len())
+                } else {
+                    String::new()
+                };
+
+                CommandResult::Message(format!(
+                    "Teleport link generated for session {}:\n\n{}{}\n\n\
+                     Share this link or use: /teleport import <link-url>",
+                    ctx.session_id,
+                    link,
+                    size_hint,
+                ))
+            }
+
+            "" => {
+                // No subcommand — show usage.
+                CommandResult::Message(
+                    "Usage:\n\
+                     \x20 /teleport export [--output <file>]   export session to .teleport bundle\n\
+                     \x20 /teleport import <file>              restore a .teleport bundle\n\
+                     \x20 /teleport link                       generate a teleport:// deep link\n\
+                     \nSee /help teleport for details.".to_string()
+                )
+            }
+
+            other => CommandResult::Error(format!(
+                "Unknown /teleport subcommand '{}'. Valid: export, import, link",
+                other
+            )),
         }
     }
 }
@@ -4914,7 +7002,7 @@ impl SlashCommand for CtxVizCommand {
             |(conv, tool), msg| {
                 let text = msg.get_all_text();
                 // Heuristic: if the message looks like a tool result, count separately
-                if msg.role == cc_core::types::Role::User && text.starts_with('[') {
+                if msg.role == claurst_core::types::Role::User && text.starts_with('[') {
                     (conv, tool + text.len())
                 } else {
                     (conv + text.len(), tool)
@@ -4962,27 +7050,120 @@ impl SlashCommand for SandboxToggleCommand {
     fn aliases(&self) -> Vec<&str> { vec!["sandbox"] }
     fn description(&self) -> &str { "Enable or disable sandboxed execution of shell commands" }
     fn help(&self) -> &str {
-        "Usage: /sandbox-toggle [on|off]\n\n\
+        "Usage: /sandbox-toggle [on|off|exclude <pattern>|status]\n\n\
          Toggles sandboxed execution of bash/shell commands.\n\
          When sandbox mode is enabled, shell commands run in an isolated\n\
          environment to prevent unintended side effects.\n\n\
-         With no argument: toggle the current state.\n\
-         With 'on' or 'off': set explicitly.\n\n\
+         Subcommands:\n\
+           /sandbox-toggle           — toggle the current state\n\
+           /sandbox-toggle on        — enable sandbox mode\n\
+           /sandbox-toggle off       — disable sandbox mode\n\
+           /sandbox-toggle status    — show current state and excluded patterns\n\
+           /sandbox-toggle exclude <pattern>  — add a command pattern to exclusions\n\n\
+         Sandbox is supported on macOS, Linux, and WSL2.\n\
          Note: A restart is recommended for full effect."
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let args = args.trim();
+
+        // Platform support check: sandbox requires macOS or Linux (not Windows native).
+        let platform = std::env::consts::OS;
+        let is_wsl = std::env::var("WSL_DISTRO_NAME").is_ok()
+            || std::env::var("WSL_INTEROP").is_ok();
+        let is_supported = matches!(platform, "linux" | "macos") || is_wsl;
+
+        // Handle subcommand: status
+        if args == "status" {
+            let ui = load_ui_settings();
+            let mode = if ui.sandbox_mode.unwrap_or(false) { "enabled" } else { "disabled" };
+            let excl = if ui.sandbox_excluded_commands.is_empty() {
+                "(none)".to_string()
+            } else {
+                ui.sandbox_excluded_commands
+                    .iter()
+                    .map(|p| format!("  - {}", p))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let platform_note = if is_supported {
+                format!("\u{2713} Supported on this platform ({})", platform)
+            } else {
+                format!("\u{2717} Not supported on this platform ({}). Requires macOS, Linux, or WSL2.", platform)
+            };
+            return CommandResult::Message(format!(
+                "Sandbox mode: {}\n\
+                 Platform:     {}\n\
+                 Excluded command patterns:\n{}\n\n\
+                 Use /sandbox-toggle [on|off] to change mode.\n\
+                 Use /sandbox-toggle exclude <pattern> to add exclusions.",
+                mode, platform_note, excl
+            ));
+        }
+
+        // Handle subcommand: exclude <pattern>
+        if let Some(rest) = args.strip_prefix("exclude").map(str::trim) {
+            if rest.is_empty() {
+                return CommandResult::Error(
+                    "Usage: /sandbox-toggle exclude <command-pattern>\n\
+                     Example: /sandbox-toggle exclude \"npm run test:*\"".to_string()
+                );
+            }
+            // Strip surrounding quotes if present
+            let pattern = rest.trim_matches(|c| c == '"' || c == '\'').to_string();
+            if pattern.is_empty() {
+                return CommandResult::Error("Pattern cannot be empty.".to_string());
+            }
+            match mutate_ui_settings(|s| {
+                if !s.sandbox_excluded_commands.contains(&pattern) {
+                    s.sandbox_excluded_commands.push(pattern.clone());
+                }
+            }) {
+                Ok(_) => {
+                    let settings_path = ui_settings_path();
+                    return CommandResult::Message(format!(
+                        "Added \"{}\" to sandbox excluded commands.\n\
+                         Saved to: {}",
+                        pattern,
+                        settings_path.display()
+                    ));
+                }
+                Err(e) => return CommandResult::Error(format!("Failed to save exclusion: {}", e)),
+            }
+        }
+
+        // Platform guard for toggling on/off
+        if !is_supported && (args == "on" || args == "enable" || args == "enabled"
+            || args == "true" || args == "1" || args.is_empty())
+        {
+            let msg = if is_wsl {
+                "Error: Sandboxing requires WSL2. WSL1 is not supported.".to_string()
+            } else {
+                format!(
+                    "Error: Sandboxing is currently only supported on macOS, Linux, and WSL2.\n\
+                     Current platform: {}",
+                    platform
+                )
+            };
+            // Only hard-block enabling; allow off/status even on unsupported platforms.
+            if args != "off" && args != "disable" && args != "disabled"
+                && args != "false" && args != "0"
+            {
+                return CommandResult::Error(msg);
+            }
+        }
+
         // Read current sandbox state from ui-settings
         let current_ui = load_ui_settings();
         let currently_enabled = current_ui.sandbox_mode.unwrap_or(false);
 
-        let enable = match args.trim() {
+        let enable = match args {
             "on" | "enable" | "enabled" | "true" | "1" => true,
             "off" | "disable" | "disabled" | "false" | "0" => false,
             "" => !currently_enabled,
             other => {
                 return CommandResult::Error(format!(
-                    "Unknown argument '{}'. Use: /sandbox-toggle [on|off]",
+                    "Unknown argument '{}'. Use: /sandbox-toggle [on|off|status|exclude <pattern>]",
                     other
                 ))
             }
@@ -4992,7 +7173,8 @@ impl SlashCommand for SandboxToggleCommand {
             Ok(_) => {
                 let state = if enable { "enabled" } else { "disabled" };
                 CommandResult::Message(format!(
-                    "Sandbox mode {}. Restart recommended for full effect.",
+                    "Sandbox mode {}. Restart recommended for full effect.\n\
+                     Use /sandbox-toggle exclude <pattern> to bypass sandboxing for specific commands.",
                     state
                 ))
             }
@@ -5076,10 +7258,10 @@ impl SlashCommand for InsightsCommand {
 
         // Count turns (user / assistant pairs)
         let user_turns: usize = messages.iter()
-            .filter(|m| matches!(m.role, cc_core::types::Role::User))
+            .filter(|m| matches!(m.role, claurst_core::types::Role::User))
             .count();
         let assistant_turns: usize = messages.iter()
-            .filter(|m| matches!(m.role, cc_core::types::Role::Assistant))
+            .filter(|m| matches!(m.role, claurst_core::types::Role::Assistant))
             .count();
         let total_turns = user_turns.min(assistant_turns);
 
@@ -5088,7 +7270,7 @@ impl SlashCommand for InsightsCommand {
             std::collections::HashMap::new();
         for msg in messages {
             for block in msg.get_tool_use_blocks() {
-                if let cc_core::types::ContentBlock::ToolUse { name, .. } = block {
+                if let claurst_core::types::ContentBlock::ToolUse { name, .. } = block {
                     *tool_counts.entry(name.clone()).or_insert(0) += 1;
                 }
             }
@@ -5267,6 +7449,227 @@ impl SlashCommand for NamedCommandAdapter {
     }
 }
 
+// ---- /undo ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for UndoCommand {
+    fn name(&self) -> &str { "undo" }
+    fn description(&self) -> &str { "Revert file changes made by a tool call in this session" }
+    fn help(&self) -> &str {
+        "Usage: /undo [<tool_use_id>]\n\n\
+         Without an argument, lists all tool calls that modified files in this session.\n\n\
+         With a tool_use_id argument, reverts all file changes made by that specific tool\n\
+         call (restoring files to their state before the tool ran).\n\n\
+         Examples:\n\
+           /undo                   — list recent edits\n\
+           /undo toolu_01XYZ...    — revert that specific tool call"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        // Retrieve the SnapshotManager from the per-session registry.
+        let session_id = ctx.session_id.clone();
+        let snap = claurst_tools::session_snapshot(&session_id);
+        let snap = snap.lock();
+
+        let args = args.trim();
+
+        if args.is_empty() {
+            // List mode: show all recorded tool calls and the files they touched.
+            let changes = snap.list_changes();
+            if changes.is_empty() {
+                return CommandResult::Message(
+                    "No file changes recorded for this session yet.".to_string(),
+                );
+            }
+
+            let mut lines = vec!["Recorded file changes this session:".to_string()];
+            for (id, paths) in &changes {
+                lines.push(format!("  {} ({} file(s)):", id, paths.len()));
+                for p in paths {
+                    lines.push(format!("      {}", p));
+                }
+            }
+            lines.push(String::new());
+            lines.push("Run /undo <tool_use_id> to revert a specific set of changes.".to_string());
+            return CommandResult::Message(lines.join("\n"));
+        }
+
+        // Revert mode.
+        let tool_use_id = args;
+        let (reverted, errors) = snap.revert(tool_use_id);
+
+        if reverted.is_empty() && errors.is_empty() {
+            return CommandResult::Error(format!(
+                "No changes found for tool_use_id '{}'. Use /undo with no arguments to list available IDs.",
+                tool_use_id
+            ));
+        }
+
+        let mut msg = format!(
+            "Reverted {} file(s) for tool call '{}':",
+            reverted.len(),
+            tool_use_id
+        );
+        for p in &reverted {
+            msg.push_str(&format!("\n  {}", p));
+        }
+        if !errors.is_empty() {
+            msg.push_str("\n\nErrors:");
+            for e in &errors {
+                msg.push_str(&format!("\n  {}", e));
+            }
+        }
+
+        CommandResult::Message(msg)
+    }
+}
+
+// ---- /providers -------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ProvidersCommand {
+    fn name(&self) -> &str { "providers" }
+    fn description(&self) -> &str { "List available AI providers and their status" }
+    fn help(&self) -> &str {
+        "Usage: /providers\n\nList all providers registered in the model registry with their\nmodel counts, context windows, and pricing information."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let registry = claurst_api::ModelRegistry::new();
+        let all = registry.list_all();
+
+        if all.is_empty() {
+            return CommandResult::Message("No providers available.".to_string());
+        }
+
+        // Group by provider
+        use std::collections::HashMap;
+        let mut by_provider: HashMap<String, Vec<_>> = HashMap::new();
+        for entry in &all {
+            by_provider
+                .entry(entry.info.provider_id.to_string())
+                .or_default()
+                .push(entry);
+        }
+
+        // Sort providers alphabetically for stable output
+        let mut provider_keys: Vec<String> = by_provider.keys().cloned().collect();
+        provider_keys.sort();
+
+        let mut lines = vec!["Available providers:\n".to_string()];
+        for provider in &provider_keys {
+            let models = &by_provider[provider];
+            lines.push(format!("\n{} ({} model{})", provider.to_uppercase(), models.len(),
+                if models.len() == 1 { "" } else { "s" }));
+            for m in models.iter().take(3) {
+                let cost_str = match (m.cost_input, m.cost_output) {
+                    (Some(i), Some(o)) => format!("${:.2}/${:.2} per 1M", i, o),
+                    _ => "free/local".to_string(),
+                };
+                lines.push(format!("  {} — {}K ctx, {}",
+                    m.info.id, m.info.context_window / 1000, cost_str));
+            }
+            if models.len() > 3 {
+                lines.push(format!("  ... and {} more", models.len() - 3));
+            }
+        }
+
+        CommandResult::Message(lines.join("\n"))
+    }
+}
+
+// ---- /connect -------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ConnectCommand {
+    fn name(&self) -> &str { "connect" }
+    fn description(&self) -> &str { "Connect an AI provider" }
+    fn help(&self) -> &str {
+        "Usage: /connect\n\nOpens the interactive provider picker dialog.\nSelect a provider to see setup instructions."
+    }
+
+    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        // This is handled by the TUI interceptor — opening the connect dialog.
+        CommandResult::Message("Use the connect dialog to set up a provider.".to_string())
+    }
+}
+
+// ---- /agent ---------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for AgentCommand {
+    fn name(&self) -> &str { "agent" }
+    fn description(&self) -> &str { "List available agents or get info about a specific agent" }
+    fn help(&self) -> &str {
+        "Usage: /agent [name]\n\nWithout arguments, lists all available named agents.\nWith a name, shows details for that agent.\n\nTo use an agent, start Claurst with: --agent <name>"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        use std::collections::HashMap;
+
+        // Merge built-in defaults with user-defined agents (user wins on collision).
+        let mut all_agents: HashMap<String, claurst_core::AgentDefinition> =
+            claurst_core::default_agents();
+        all_agents.extend(ctx.config.agents.clone());
+
+        let agent_name = args.trim();
+
+        if agent_name.is_empty() {
+            // List all visible agents.
+            let mut keys: Vec<&String> = all_agents
+                .iter()
+                .filter(|(_, d)| d.visible)
+                .map(|(k, _)| k)
+                .collect();
+            keys.sort();
+
+            let mut output = "Available agents:\n\n".to_string();
+            for name in keys {
+                let def = &all_agents[name];
+                output.push_str(&format!(
+                    "  @{} — {}\n    access: {}{}\n",
+                    name,
+                    def.description.as_deref().unwrap_or(""),
+                    def.access,
+                    def.max_turns
+                        .map(|t| format!(", max_turns: {}", t))
+                        .unwrap_or_default(),
+                ));
+            }
+            output.push_str("\nUse --agent <name> when starting Claurst to activate an agent.");
+            CommandResult::Message(output)
+        } else if let Some(def) = all_agents.get(agent_name) {
+            // Show details for the named agent.
+            let mut output = format!("Agent: @{}\n", agent_name);
+            if let Some(ref desc) = def.description {
+                output.push_str(&format!("Description: {}\n", desc));
+            }
+            output.push_str(&format!("Access: {}\n", def.access));
+            if let Some(ref model) = def.model {
+                output.push_str(&format!("Model: {}\n", model));
+            }
+            if let Some(t) = def.max_turns {
+                output.push_str(&format!("Max turns: {}\n", t));
+            }
+            if let Some(ref color) = def.color {
+                output.push_str(&format!("Color: {}\n", color));
+            }
+            if let Some(ref prompt) = def.prompt {
+                output.push_str(&format!("\nSystem prompt prefix:\n  {}\n", prompt));
+            }
+            output.push_str(&format!(
+                "\nTo activate: claude --agent {}", agent_name
+            ));
+            CommandResult::Message(output)
+        } else {
+            CommandResult::Error(format!(
+                "Unknown agent '{}'. Run /agent to see available agents.",
+                agent_name
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -5294,6 +7697,10 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(DoctorCommand),
         Box::new(LoginCommand),
         Box::new(LogoutCommand),
+        Box::new(RefreshCommand),
+        Box::new(CavemanCommand),
+        Box::new(RockyCommand),
+        Box::new(NormalCommand),
         Box::new(InitCommand),
         Box::new(ReviewCommand),
         Box::new(HooksCommand),
@@ -5302,6 +7709,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(PlanCommand),
         Box::new(TasksCommand),
         Box::new(SessionCommand),
+        Box::new(ForkCommand),
         Box::new(ThinkingCommand),
         Box::new(ThemeCommand),
         Box::new(OutputStyleCommand),
@@ -5321,7 +7729,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             slash_name: "add-dir",
             target_name: "add-dir",
             slash_aliases: &[],
-            slash_description: "Add a directory to Claude Code's allowed workspace paths",
+            slash_description: "Add a directory to Claurst's allowed workspace paths",
             slash_help: "Usage: /add-dir <path>",
         }),
         Box::new(NamedCommandAdapter {
@@ -5349,7 +7757,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             slash_name: "passes",
             target_name: "passes",
             slash_aliases: &[],
-            slash_description: "Share a free week of Claude Code with friends",
+            slash_description: "Share a free week of Claurst with friends",
             slash_help: "Usage: /passes",
         }),
         Box::new(NamedCommandAdapter {
@@ -5370,28 +7778,28 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
             slash_name: "desktop",
             target_name: "desktop",
             slash_aliases: &[],
-            slash_description: "Open the Claude Code desktop app",
+            slash_description: "Open the Claurst desktop app",
             slash_help: "Usage: /desktop",
         }),
         Box::new(NamedCommandAdapter {
             slash_name: "mobile",
             target_name: "mobile",
             slash_aliases: &[],
-            slash_description: "Set up Claude Code on mobile",
+            slash_description: "Set up Claurst on mobile",
             slash_help: "Usage: /mobile",
         }),
         Box::new(NamedCommandAdapter {
             slash_name: "install-github-app",
             target_name: "install-github-app",
             slash_aliases: &[],
-            slash_description: "Set up Claude GitHub Actions for a repository",
+            slash_description: "Set up Claurst GitHub Actions for a repository",
             slash_help: "Usage: /install-github-app",
         }),
         Box::new(NamedCommandAdapter {
             slash_name: "web-setup",
             target_name: "remote-setup",
             slash_aliases: &["remote-setup"],
-            slash_description: "Configure a remote Claude Code environment",
+            slash_description: "Configure a remote Claurst environment",
             slash_help: "Usage: /web-setup",
         }),
         Box::new(NamedCommandAdapter {
@@ -5434,6 +7842,15 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(HeapdumpCommand),
         Box::new(InsightsCommand),
         Box::new(UltrareviewCommand),
+        // Undo / snapshot
+        Box::new(UndoCommand),
+        // Multi-provider support
+        Box::new(ProvidersCommand),
+        Box::new(ConnectCommand),
+        // Named agent system
+        Box::new(AgentCommand),
+        // Session search (SQLite)
+        Box::new(SearchCommand),
     ]
 }
 
@@ -5447,15 +7864,113 @@ pub fn find_command(name: &str) -> Option<Box<dyn SlashCommand>> {
 
 /// Build `HelpEntry` values for all non-hidden commands, suitable for
 /// populating `HelpOverlay::commands` at startup.
-pub fn build_help_entries() -> Vec<cc_tui::overlays::HelpEntry> {
+pub fn build_help_entries() -> Vec<claurst_tui::overlays::HelpEntry> {
     all_commands()
         .iter()
         .filter(|c| !c.hidden())
-        .map(|c| cc_tui::overlays::HelpEntry {
+        .map(|c| claurst_tui::overlays::HelpEntry {
             name: c.name().to_string(),
             aliases: c.aliases().join(", "),
             description: c.description().to_string(),
             category: command_category(c.name()).to_string(),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// User-defined command templates (Feature 2)
+// ---------------------------------------------------------------------------
+
+/// A slash command backed by a user-defined template in `settings.json`.
+struct TemplateCommand {
+    name: String,
+    template: claurst_core::CommandTemplate,
+}
+
+#[async_trait]
+impl SlashCommand for TemplateCommand {
+    fn name(&self) -> &str { &self.name }
+    fn description(&self) -> &str {
+        self.template.description.as_deref().unwrap_or("Custom command")
+    }
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let mut words = args.split_whitespace();
+        let arg1 = words.next().unwrap_or("");
+        let arg2 = words.next().unwrap_or("");
+        let prompt = self.template.template
+            .replace("$ARGUMENTS", args)
+            .replace("$1", arg1)
+            .replace("$2", arg2);
+        CommandResult::UserMessage(prompt)
+    }
+}
+
+/// Build slash commands from user-defined command templates stored in
+/// `settings.commands`.
+pub fn commands_from_settings(settings: &claurst_core::Settings) -> Vec<Box<dyn SlashCommand>> {
+    settings.commands.iter().map(|(name, template)| {
+        Box::new(TemplateCommand {
+            name: name.clone(),
+            template: template.clone(),
+        }) as Box<dyn SlashCommand>
+    }).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Discovered skill commands (from .claurst/skills/ and git URLs)
+// ---------------------------------------------------------------------------
+
+/// A slash command backed by a discovered skill markdown file.
+struct SkillCommand {
+    name: String,
+    description: String,
+    template: String,
+}
+
+#[async_trait]
+impl SlashCommand for SkillCommand {
+    fn name(&self) -> &str { &self.name }
+    fn description(&self) -> &str { &self.description }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let mut words = args.split_whitespace();
+        let arg1 = words.next().unwrap_or("");
+        let arg2 = words.next().unwrap_or("");
+        let prompt = self.template
+            .replace("$ARGUMENTS", args)
+            .replace("$1", arg1)
+            .replace("$2", arg2);
+        CommandResult::UserMessage(prompt)
+    }
+}
+
+/// Build slash commands from skill markdown files discovered on the filesystem
+/// and from configured git URLs.
+///
+/// Pass the project `cwd` and the `skills` section of the effective config.
+/// Bundled skills take precedence — any discovered skill whose name clashes
+/// with a built-in command will be silently skipped.
+pub fn commands_from_discovered_skills(
+    cwd: &std::path::Path,
+    skills_config: &claurst_core::SkillsConfig,
+) -> Vec<Box<dyn SlashCommand>> {
+    let discovered = claurst_core::discover_skills(cwd, skills_config);
+    // Build a set of built-in command names so we can skip collisions.
+    let all_cmds = all_commands();
+    let builtin_names: std::collections::HashSet<&str> = all_cmds
+        .iter()
+        .map(|c| c.name())
+        .collect();
+
+    discovered
+        .into_values()
+        .filter(|skill| !builtin_names.contains(skill.name.as_str()))
+        .map(|skill| {
+            Box::new(SkillCommand {
+                name: skill.name,
+                description: skill.description,
+                template: skill.template,
+            }) as Box<dyn SlashCommand>
         })
         .collect()
 }
@@ -5465,18 +7980,37 @@ pub async fn execute_command(
     input: &str,
     ctx: &mut CommandContext,
 ) -> Option<CommandResult> {
-    if !cc_tui::input::is_slash_command(input) { return None; }
-    let (name, args) = cc_tui::input::parse_slash_command(input);
+    if !claurst_tui::input::is_slash_command(input) { return None; }
+    let (name, args) = claurst_tui::input::parse_slash_command(input);
 
     // First check built-in commands.
     if let Some(cmd) = find_command(name) {
         return Some(cmd.execute(args, ctx).await);
     }
 
+    // Check user-defined command templates from settings.
+    let cmd_name = name.trim_start_matches('/');
+    if let Some(tmpl) = ctx.config.commands.get(cmd_name).cloned() {
+        let tc = TemplateCommand { name: cmd_name.to_string(), template: tmpl };
+        return Some(tc.execute(args, ctx).await);
+    }
+
+    // Check discovered skill commands (from .claurst/skills/, git URLs, etc.).
+    {
+        let discovered = claurst_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
+        if let Some(skill) = discovered.get(cmd_name) {
+            let sc = SkillCommand {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                template: skill.template.clone(),
+            };
+            return Some(sc.execute(args, ctx).await);
+        }
+    }
+
     // Then check plugin-defined slash commands.
     let project_dir = ctx.working_dir.clone();
-    let registry = cc_plugins::load_plugins(&project_dir, &[]).await;
-    let cmd_name = name.trim_start_matches('/');
+    let registry = claurst_plugins::load_plugins(&project_dir, &[]).await;
     for cmd_def in registry.all_command_defs() {
         if cmd_def.name == cmd_name {
             let adapter = PluginSlashCommandAdapter { def: cmd_def };
@@ -5499,11 +8033,11 @@ pub mod named_commands;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cc_core::cost::CostTracker;
+    use claurst_core::cost::CostTracker;
 
     fn make_ctx() -> CommandContext {
         CommandContext {
-            config: cc_core::config::Config::default(),
+            config: claurst_core::config::Config::default(),
             cost_tracker: CostTracker::new(),
             messages: vec![],
             working_dir: std::path::PathBuf::from("."),
@@ -5539,6 +8073,7 @@ mod tests {
         assert!(find_command("clear").is_some());
         assert!(find_command("exit").is_some());
         assert!(find_command("model").is_some());
+        assert!(find_command("refresh").is_some());
         assert!(find_command("version").is_some());
     }
 
@@ -5574,7 +8109,7 @@ mod tests {
         let expected = [
             "help", "clear", "compact", "cost", "exit", "model",
             "config", "version", "status", "diff", "memory", "hooks",
-            "permissions", "plan", "tasks", "session", "login", "logout",
+            "permissions", "plan", "tasks", "session", "login", "logout", "refresh",
             "feedback", "usage", "plugin", "reload-plugins",
             "add-dir", "agents", "branch", "tag",
             "passes", "ide", "pr-comments", "desktop", "mobile",
@@ -5600,6 +8135,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_refresh_command_requests_provider_reset() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("refresh").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        assert!(matches!(result, CommandResult::RefreshProviderState));
+    }
+
+    #[tokio::test]
     async fn test_exit_command_returns_exit() {
         let mut ctx = make_ctx();
         let cmd = find_command("exit").unwrap();
@@ -5615,7 +8158,7 @@ mod tests {
         assert!(matches!(result, CommandResult::Message(_)));
         if let CommandResult::Message(msg) = result {
             assert!(
-                msg.contains("claude") || msg.contains("Claude") || msg.contains('.'),
+                msg.contains("claude") || msg.contains("Claurst") || msg.contains('.'),
                 "Version message should contain version number, got: {}",
                 msg
             );

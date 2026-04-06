@@ -1,4 +1,4 @@
-// cc-api: Anthropic API client with streaming SSE support for the Claude Code
+// claurst-api: Anthropic API client with streaming SSE support for Claurst
 // Rust port.
 //
 // Handles:
@@ -9,9 +9,9 @@
 // - Rate-limit (429) and overloaded (529) retry with exponential back-off
 // - Authentication via API key from env or config
 
-use cc_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
-use cc_core::error::ClaudeError;
-use cc_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition, UsageInfo};
+use claurst_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
+use claurst_core::error::ClaudeError;
+use claurst_core::types::{ContentBlock, Message, MessageContent, Role, ToolDefinition, UsageInfo};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,11 +21,83 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
+// Modules
+// ---------------------------------------------------------------------------
+pub mod cch;
+pub mod codex_adapter;
+
+// Provider-agnostic unified types (Phase 1A).
+pub mod provider_types;
+pub mod provider_error;
+
+// Provider abstraction traits (Phase 1B).
+pub mod provider;
+pub mod auth;
+pub mod stream_parser;
+pub mod transform;
+
+// Provider registry (Phase 1C).
+pub mod registry;
+
+// Concrete provider adapters (Phase 1D).
+pub mod providers;
+
+// Model Registry (Phase 3).
+pub mod model_registry;
+
+// Provider-aware error handling (Phase 6).
+pub mod error_handling;
+
+// Message transform layer — concrete transformers (Phase 4).
+pub mod transformers;
+
+// ---------------------------------------------------------------------------
 // Public re-exports
 // ---------------------------------------------------------------------------
 pub use client::AnthropicClient;
-pub use streaming::{StreamEvent, StreamHandler};
+pub use streaming::{AnthropicStreamEvent, StreamHandler};
 pub use types::*;
+
+// Phase 1A re-exports — provider-agnostic layer.
+pub use provider_types::*;
+pub use provider_error::ProviderError;
+
+// Phase 1B re-exports — provider abstraction traits.
+pub use provider::{LlmProvider, ModelInfo};
+pub use auth::{AuthProvider, LoginFlow};
+pub use stream_parser::{StreamParser, SseStreamParser, JsonLinesStreamParser};
+pub use transform::MessageTransformer;
+
+// Phase 1C re-exports — provider registry.
+pub use registry::ProviderRegistry;
+
+// Phase 1D re-exports — concrete provider adapters.
+pub use providers::AnthropicProvider;
+pub use providers::GoogleProvider;
+pub use providers::OpenAiProvider;
+
+// Phase 3 re-exports — model registry.
+pub use model_registry::{ModelEntry, ModelRegistry, effective_model_for_config};
+
+// Phase 6 re-exports — provider-aware error handling.
+pub use error_handling::{is_context_overflow, parse_error_response, RetryConfig};
+
+// Phase 2E re-exports — Azure, Bedrock, and GitHub Copilot providers.
+pub use providers::AzureProvider;
+pub use providers::BedrockProvider;
+pub use providers::CopilotProvider;
+
+// Phase 2B re-exports — OpenAI-compatible generic adapter + common factories.
+pub use providers::{
+    OpenAiCompatProvider,
+    ollama, lm_studio, deepseek, groq, xai, openrouter, mistral,
+};
+
+// Phase 2D re-exports — Cohere native provider.
+pub use providers::CohereProvider;
+
+// Phase 4 re-exports — concrete message transformers.
+pub use transformers::{AnthropicTransformer, OpenAiChatTransformer};
 
 // ---------------------------------------------------------------------------
 // request / response types
@@ -186,9 +258,9 @@ pub mod types {
 pub mod streaming {
     use super::*;
 
-    /// Events emitted by the streaming SSE parser.
+    /// Events emitted by the Anthropic SSE streaming parser.
     #[derive(Debug, Clone)]
-    pub enum StreamEvent {
+    pub enum AnthropicStreamEvent {
         /// The overall message has started; carries the message id and model.
         MessageStart {
             id: String,
@@ -225,6 +297,7 @@ pub mod streaming {
         Ping,
     }
 
+
     /// The delta payload inside a `content_block_delta` event.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
@@ -237,13 +310,13 @@ pub mod streaming {
 
     /// Trait for anything that wants to consume streaming events in real time.
     pub trait StreamHandler: Send + Sync {
-        fn on_event(&self, event: &StreamEvent);
+        fn on_event(&self, event: &AnthropicStreamEvent);
     }
 
     /// A no-op handler useful for non-interactive / batch mode.
     pub struct NullStreamHandler;
     impl StreamHandler for NullStreamHandler {
-        fn on_event(&self, _event: &StreamEvent) {}
+        fn on_event(&self, _event: &AnthropicStreamEvent) {}
     }
 }
 
@@ -322,6 +395,21 @@ pub struct AvailableModel {
 pub mod client {
     use super::*;
 
+    /// Provider selection for API calls.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Provider {
+        /// Use Anthropic's API
+        Anthropic,
+        /// Use OpenAI Codex via OAuth
+        Codex,
+    }
+
+    impl Default for Provider {
+        fn default() -> Self {
+            Provider::Anthropic
+        }
+    }
+
     /// Configuration for the HTTP client.
     #[derive(Debug, Clone)]
     pub struct ClientConfig {
@@ -336,13 +424,15 @@ pub mod client {
         /// When true, send `Authorization: Bearer <api_key>` instead of `x-api-key`.
         /// Used for Claude.ai subscription (OAuth user:inference scope) tokens.
         pub use_bearer_auth: bool,
+        /// Which provider to use for API calls.
+        pub provider: Provider,
     }
 
     impl Default for ClientConfig {
         fn default() -> Self {
             Self {
                 api_key: String::new(),
-                api_base: cc_core::constants::ANTHROPIC_API_BASE.to_string(),
+                api_base: claurst_core::constants::ANTHROPIC_API_BASE.to_string(),
                 api_version: ANTHROPIC_API_VERSION.to_string(),
                 beta_features: ANTHROPIC_BETA_HEADER.to_string(),
                 max_retries: 5,
@@ -350,6 +440,7 @@ pub mod client {
                 max_retry_delay: Duration::from_secs(60),
                 request_timeout: Duration::from_secs(600),
                 use_bearer_auth: false,
+                provider: Provider::Anthropic,
             }
         }
     }
@@ -361,14 +452,19 @@ pub mod client {
     }
 
     impl AnthropicClient {
+        /// Returns `true` when the client was constructed without an API key.
+        ///
+        /// The query loop checks this to know whether it should fall back to
+        /// a runtime-built provider (e.g. from keys stored via `/connect`).
+        pub fn api_key_is_empty(&self) -> bool {
+            self.config.api_key.is_empty()
+        }
+
         /// Build a new client.  Panics if `config.api_key` is empty.
         pub fn new(config: ClientConfig) -> anyhow::Result<Self> {
-            if config.api_key.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Anthropic API key is required. Set ANTHROPIC_API_KEY or pass --api-key."
-                ));
-            }
-
+            // Allow empty key at construction — validation is deferred to
+            // the first API call, so non-Anthropic provider setups can still
+            // create this client without an Anthropic key configured.
             let http = reqwest::Client::builder()
                 .timeout(config.request_timeout)
                 .build()?;
@@ -377,7 +473,7 @@ pub mod client {
         }
 
         /// Convenience constructor that resolves the key from config/env.
-        pub fn from_config(cfg: &cc_core::config::Config) -> anyhow::Result<Self> {
+        pub fn from_config(cfg: &claurst_core::config::Config) -> anyhow::Result<Self> {
             let api_key = cfg
                 .resolve_api_key()
                 .ok_or_else(|| anyhow::anyhow!("No API key found"))?;
@@ -397,6 +493,60 @@ pub mod client {
             &self,
             mut request: CreateMessageRequest,
         ) -> Result<CreateMessageResponse, ClaudeError> {
+            // Deferred key validation — fail here rather than at construction
+            // so that non-Anthropic provider setups don't crash on startup.
+            if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
+                // Check if this model might belong to another provider, giving
+                // the user a more actionable error message.
+                let model = &request.model;
+                let hint = if model.starts_with("gemini") || model.starts_with("gemma") {
+                    format!(
+                        "Model '{}' is a Google model. Use `--provider google` or set GOOGLE_API_KEY.",
+                        model
+                    )
+                } else if model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+                    format!(
+                        "Model '{}' is an OpenAI model. Use `--provider openai` or set OPENAI_API_KEY.",
+                        model
+                    )
+                } else if model.starts_with("deepseek") {
+                    format!(
+                        "Model '{}' is a DeepSeek model. Use `--provider deepseek` or set DEEPSEEK_API_KEY.",
+                        model
+                    )
+                } else if model.starts_with("grok") {
+                    format!(
+                        "Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.",
+                        model
+                    )
+                } else if model.starts_with("mistral") || model.starts_with("codestral") {
+                    format!(
+                        "Model '{}' is a Mistral model. Use `--provider mistral` or set MISTRAL_API_KEY.",
+                        model
+                    )
+                } else if model.starts_with("command-") {
+                    format!(
+                        "Model '{}' is a Cohere model. Use `--provider cohere` or set COHERE_API_KEY.",
+                        model
+                    )
+                } else if model.starts_with("llama") {
+                    format!(
+                        "Model '{}' looks like a Llama model. Use `--provider groq` (set GROQ_API_KEY) or `--provider ollama` for local.",
+                        model
+                    )
+                } else {
+                    "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
+                     or use --provider to select a different provider (e.g. --provider openai).".to_string()
+                };
+                return Err(ClaudeError::Auth(
+                    format!("No API key for the selected model. {}", hint)
+                ));
+            }
+            // Route to Codex if configured
+            if self.config.provider == Provider::Codex {
+                return self.create_message_codex(&request).await;
+            }
+
             request.stream = false;
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
@@ -411,6 +561,49 @@ pub mod client {
             serde_json::from_str(&text).map_err(ClaudeError::Json)
         }
 
+        /// Send a request to OpenAI Codex API instead of Anthropic.
+        async fn create_message_codex(
+            &self,
+            request: &CreateMessageRequest,
+        ) -> Result<CreateMessageResponse, ClaudeError> {
+            // Convert Anthropic format to OpenAI format
+            let openai_req = codex_adapter::anthropic_to_openai_request(request);
+
+            // Send to Codex endpoint
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(codex_adapter::CODEX_RESPONSES_ENDPOINT)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .header("Content-Type", "application/json")
+                .json(&openai_req)
+                .timeout(self.config.request_timeout)
+                .send()
+                .await
+                .map_err(|e| ClaudeError::Other(format!("Codex request failed: {}", e)))?;
+
+            let status = resp.status();
+            let text = resp.text().await.map_err(ClaudeError::Http)?;
+
+            if !status.is_success() {
+                return Err(self.parse_api_error(status.as_u16(), &text));
+            }
+
+            // Parse OpenAI response and convert to Anthropic format
+            let openai_resp: Value = serde_json::from_str(&text).map_err(ClaudeError::Json)?;
+            let (content, stop_reason, input_tokens, output_tokens) =
+                codex_adapter::parse_openai_response(&openai_resp);
+
+            let response = codex_adapter::build_anthropic_response(
+                &content,
+                &stop_reason,
+                input_tokens,
+                output_tokens,
+                &request.model,
+            );
+
+            Ok(response)
+        }
+
         // ---- Streaming create message ------------------------------------
 
         /// Send a streaming `POST /v1/messages`.  Events are dispatched to the
@@ -420,7 +613,45 @@ pub mod client {
             &self,
             mut request: CreateMessageRequest,
             handler: Arc<dyn StreamHandler>,
-        ) -> Result<mpsc::Receiver<StreamEvent>, ClaudeError> {
+        ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
+            // Deferred key validation
+            if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
+                let model = &request.model;
+                let hint = if model.starts_with("gemini") || model.starts_with("gemma") {
+                    format!(
+                        "Model '{}' is a Google model. Use `--provider google` or set GOOGLE_API_KEY.",
+                        model
+                    )
+                } else if model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+                    format!(
+                        "Model '{}' is an OpenAI model. Use `--provider openai` or set OPENAI_API_KEY.",
+                        model
+                    )
+                } else if model.starts_with("deepseek") {
+                    format!("Model '{}' is a DeepSeek model. Use `--provider deepseek` or set DEEPSEEK_API_KEY.", model)
+                } else if model.starts_with("grok") {
+                    format!("Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.", model)
+                } else if model.starts_with("mistral") || model.starts_with("codestral") {
+                    format!("Model '{}' is a Mistral model. Use `--provider mistral` or set MISTRAL_API_KEY.", model)
+                } else if model.starts_with("command-") {
+                    format!("Model '{}' is a Cohere model. Use `--provider cohere` or set COHERE_API_KEY.", model)
+                } else if model.starts_with("llama") {
+                    format!("Model '{}' looks like a Llama model. Use `--provider groq` or `--provider ollama` for local.", model)
+                } else {
+                    "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
+                     or use --provider to select a different provider (e.g. --provider openai).".to_string()
+                };
+                return Err(ClaudeError::Auth(
+                    format!("No API key for the selected model. {}", hint)
+                ));
+            }
+            // Codex provider doesn't support streaming yet
+            if self.config.provider == Provider::Codex {
+                return Err(ClaudeError::Other(
+                    "Codex provider does not support streaming yet".to_string(),
+                ));
+            }
+
             request.stream = true;
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
@@ -438,7 +669,7 @@ pub mod client {
             tokio::spawn(async move {
                 if let Err(e) = Self::process_sse_stream(resp, handler, tx.clone()).await {
                     let _ = tx
-                        .send(StreamEvent::Error {
+                        .send(streaming::AnthropicStreamEvent::Error {
                             error_type: "stream_error".into(),
                             message: e.to_string(),
                         })
@@ -497,8 +728,17 @@ pub mod client {
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
 
+            // Serialize body to JSON string for CCH signing
+            let body_str = serde_json::to_string(body)
+                .map_err(|e| ClaudeError::Api(format!("Failed to serialize request: {}", e)))?;
+            let body_bytes = body_str.as_bytes();
+
             loop {
                 attempts += 1;
+
+                // Compute CCH hash and build billing header
+                let cch_hash = cch::compute_cch(body_bytes);
+                let billing_header = format!("cc_version=0.1; cc_entrypoint=claude_code; {}; cc_workload=claude_code;", cch_hash);
 
                 // Use Bearer auth for Claude.ai OAuth tokens; x-api-key for regular keys.
                 let mut req = self
@@ -507,13 +747,14 @@ pub mod client {
                     .header("anthropic-version", &self.config.api_version)
                     .header("anthropic-beta", &self.config.beta_features)
                     .header("content-type", "application/json")
-                    .header("accept", "text/event-stream");
+                    .header("accept", "text/event-stream")
+                    .header("x-anthropic-billing-header", billing_header);
                 req = if self.config.use_bearer_auth {
                     req.header("Authorization", format!("Bearer {}", &self.config.api_key))
                 } else {
                     req.header("x-api-key", &self.config.api_key)
                 };
-                let req = req.json(body);
+                let req = req.body(body_str.clone());
 
                 let resp = req.send().await.map_err(ClaudeError::Http)?;
                 let status = resp.status().as_u16();
@@ -574,11 +815,11 @@ pub mod client {
             }
         }
 
-        /// Read an SSE byte stream, parse frames, and emit `StreamEvent`s.
+        /// Read an SSE byte stream, parse frames, and emit `AnthropicStreamEvent`s.
         async fn process_sse_stream(
             resp: reqwest::Response,
             handler: Arc<dyn StreamHandler>,
-            tx: mpsc::Sender<StreamEvent>,
+            tx: mpsc::Sender<streaming::AnthropicStreamEvent>,
         ) -> Result<(), ClaudeError> {
             use sse_parser::SseLineParser;
 
@@ -625,15 +866,15 @@ pub mod client {
             Ok(())
         }
 
-        /// Convert a parsed SSE frame into a typed `StreamEvent`.
+        /// Convert a parsed SSE frame into a typed `AnthropicStreamEvent`.
         fn frame_to_event(
             event_type: &Option<String>,
             data: &str,
-        ) -> Option<StreamEvent> {
+        ) -> Option<streaming::AnthropicStreamEvent> {
             let event_name = event_type.as_deref().unwrap_or("");
 
             match event_name {
-                "ping" => Some(StreamEvent::Ping),
+                "ping" => Some(streaming::AnthropicStreamEvent::Ping),
 
                 "message_start" => {
                     let v: Value = serde_json::from_str(data).ok()?;
@@ -645,7 +886,7 @@ pub mod client {
                         .and_then(|u| serde_json::from_value::<UsageInfo>(u.clone()).ok())
                         .unwrap_or_default();
 
-                    Some(StreamEvent::MessageStart { id, model, usage })
+                    Some(streaming::AnthropicStreamEvent::MessageStart { id, model, usage })
                 }
 
                 "content_block_start" => {
@@ -654,7 +895,7 @@ pub mod client {
                     let block_value = v.get("content_block")?;
                     let content_block: ContentBlock =
                         serde_json::from_value(block_value.clone()).ok()?;
-                    Some(StreamEvent::ContentBlockStart {
+                    Some(streaming::AnthropicStreamEvent::ContentBlockStart {
                         index,
                         content_block,
                     })
@@ -666,13 +907,13 @@ pub mod client {
                     let delta_value = v.get("delta")?;
                     let delta: streaming::ContentDelta =
                         serde_json::from_value(delta_value.clone()).ok()?;
-                    Some(StreamEvent::ContentBlockDelta { index, delta })
+                    Some(streaming::AnthropicStreamEvent::ContentBlockDelta { index, delta })
                 }
 
                 "content_block_stop" => {
                     let v: Value = serde_json::from_str(data).ok()?;
                     let index = v.get("index")?.as_u64()? as usize;
-                    Some(StreamEvent::ContentBlockStop { index })
+                    Some(streaming::AnthropicStreamEvent::ContentBlockStop { index })
                 }
 
                 "message_delta" => {
@@ -685,10 +926,10 @@ pub mod client {
                     let usage = v
                         .get("usage")
                         .and_then(|u| serde_json::from_value::<UsageInfo>(u.clone()).ok());
-                    Some(StreamEvent::MessageDelta { stop_reason, usage })
+                    Some(streaming::AnthropicStreamEvent::MessageDelta { stop_reason, usage })
                 }
 
-                "message_stop" => Some(StreamEvent::MessageStop),
+                "message_stop" => Some(streaming::AnthropicStreamEvent::MessageStop),
 
                 "error" => {
                     let v: Value = serde_json::from_str(data).ok()?;
@@ -703,7 +944,7 @@ pub mod client {
                         .and_then(|s| s.as_str())
                         .unwrap_or("Unknown error")
                         .to_string();
-                    Some(StreamEvent::Error {
+                    Some(streaming::AnthropicStreamEvent::Error {
                         error_type,
                         message,
                     })
@@ -863,15 +1104,16 @@ impl StreamAccumulator {
     }
 
     /// Feed a stream event. Call this for every event received from the stream.
-    pub fn on_event(&mut self, event: &StreamEvent) {
+    pub fn on_event(&mut self, event: &streaming::AnthropicStreamEvent) {
+        use streaming::AnthropicStreamEvent;
         match event {
-            StreamEvent::MessageStart { id, model, usage } => {
+            AnthropicStreamEvent::MessageStart { id, model, usage } => {
                 self.id = Some(id.clone());
                 self.model = Some(model.clone());
                 self.usage = usage.clone();
             }
 
-            StreamEvent::ContentBlockStart {
+            AnthropicStreamEvent::ContentBlockStart {
                 index,
                 content_block,
             } => {
@@ -891,7 +1133,7 @@ impl StreamAccumulator {
                 self.partials.insert(*index, partial);
             }
 
-            StreamEvent::ContentBlockDelta { index, delta } => {
+            AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
                 if let Some(partial) = self.partials.get_mut(index) {
                     match (partial, delta) {
                         (PartialBlock::Text(buf), streaming::ContentDelta::TextDelta { text }) => {
@@ -920,7 +1162,7 @@ impl StreamAccumulator {
                 }
             }
 
-            StreamEvent::ContentBlockStop { index } => {
+            AnthropicStreamEvent::ContentBlockStop { index } => {
                 if let Some(partial) = self.partials.remove(index) {
                     let block = match partial {
                         PartialBlock::Text(text) => ContentBlock::Text { text },
@@ -941,7 +1183,7 @@ impl StreamAccumulator {
                 }
             }
 
-            StreamEvent::MessageDelta { stop_reason, usage } => {
+            AnthropicStreamEvent::MessageDelta { stop_reason, usage } => {
                 if let Some(sr) = stop_reason {
                     self.stop_reason = Some(sr.clone());
                 }
@@ -952,9 +1194,9 @@ impl StreamAccumulator {
                 }
             }
 
-            StreamEvent::MessageStop => {}
-            StreamEvent::Ping => {}
-            StreamEvent::Error { .. } => {}
+            AnthropicStreamEvent::MessageStop => {}
+            AnthropicStreamEvent::Ping => {}
+            AnthropicStreamEvent::Error { .. } => {}
         }
     }
 
@@ -1007,35 +1249,35 @@ mod tests {
     #[test]
     fn test_stream_accumulator_text() {
         let mut acc = StreamAccumulator::new();
-        acc.on_event(&StreamEvent::MessageStart {
+        acc.on_event(&streaming::AnthropicStreamEvent::MessageStart {
             id: "m1".into(),
             model: "claude".into(),
             usage: UsageInfo::default(),
         });
-        acc.on_event(&StreamEvent::ContentBlockStart {
+        acc.on_event(&streaming::AnthropicStreamEvent::ContentBlockStart {
             index: 0,
             content_block: ContentBlock::Text {
                 text: String::new(),
             },
         });
-        acc.on_event(&StreamEvent::ContentBlockDelta {
+        acc.on_event(&streaming::AnthropicStreamEvent::ContentBlockDelta {
             index: 0,
             delta: streaming::ContentDelta::TextDelta {
                 text: "Hello ".into(),
             },
         });
-        acc.on_event(&StreamEvent::ContentBlockDelta {
+        acc.on_event(&streaming::AnthropicStreamEvent::ContentBlockDelta {
             index: 0,
             delta: streaming::ContentDelta::TextDelta {
                 text: "world!".into(),
             },
         });
-        acc.on_event(&StreamEvent::ContentBlockStop { index: 0 });
-        acc.on_event(&StreamEvent::MessageDelta {
+        acc.on_event(&streaming::AnthropicStreamEvent::ContentBlockStop { index: 0 });
+        acc.on_event(&streaming::AnthropicStreamEvent::MessageDelta {
             stop_reason: Some("end_turn".into()),
             usage: None,
         });
-        acc.on_event(&StreamEvent::MessageStop);
+        acc.on_event(&streaming::AnthropicStreamEvent::MessageStop);
 
         let (msg, _usage, stop) = acc.finish();
         assert_eq!(msg.get_text(), Some("Hello world!"));

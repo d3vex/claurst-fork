@@ -1,4 +1,4 @@
-// cc-plugins: Plugin runtime for the Claude Code CLI Rust port.
+// claurst-plugins: Plugin runtime for the Claurst CLI.
 //
 // This crate handles plugin discovery, manifest parsing, hook registration,
 // and the /plugin + /reload-plugins command definitions.
@@ -24,6 +24,47 @@ pub use plugin::{
     CommandRunAction, LoadedPlugin, PluginCommandDef, PluginError, PluginSource, ReloadDiff,
 };
 pub use registry::PluginRegistry;
+
+// ---------------------------------------------------------------------------
+// Capability enforcement
+// ---------------------------------------------------------------------------
+
+/// Check whether a plugin command is allowed to execute based on its declared
+/// capability grants and the capability the action requires.
+///
+/// # Policy
+/// - If the manifest has **no `capabilities` field** (`None`), the plugin
+///   predates capability enforcement and is trusted unconditionally (backwards
+///   compatibility with existing plugins).
+/// - If the manifest declares an explicit list (even an empty one), the
+///   required capability **must** appear in that list.
+///
+/// Returns `Ok(())` when execution is permitted, or `Err(reason)` when it
+/// should be blocked.  The caller should convert `Err` into a `ToolResult::error`.
+pub fn check_plugin_capability(def: &PluginCommandDef) -> Result<(), String> {
+    // Determine what capability this action needs.
+    let required = match def.run_action.required_capability() {
+        None => return Ok(()), // StaticResponse — no capability needed.
+        Some(cap) => cap,
+    };
+
+    match &def.plugin_capabilities {
+        // No `capabilities` field — old-style manifest, allow everything.
+        None => Ok(()),
+        // Explicit capability list — enforce it.
+        Some(granted) => {
+            if granted.iter().any(|g| g.as_str() == required) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Plugin '{}' is not allowed to use capability '{}'. \
+                     Add '{}' to the 'capabilities' list in its manifest to enable this action.",
+                    def.plugin_name, required, required
+                ))
+            }
+        }
+    }
+}
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -148,8 +189,8 @@ pub fn run_global_post_tool_hook(
 /// Discover and load all plugins from the standard locations.
 ///
 /// Search order:
-/// 1. `~/.claude/plugins/`  (user-global)
-/// 2. `<project_dir>/.claude/plugins/`  (project-local)
+/// 1. `~/.claurst/plugins/`  (user-global)
+/// 2. `<project_dir>/.claurst/plugins/`  (project-local)
 /// 3. Any paths listed in `extra_paths`
 ///
 /// Returns a fully populated `PluginRegistry`.  Errors encountered during
@@ -390,7 +431,7 @@ pub fn format_plugin_info(registry: &PluginRegistry, name: &str) -> String {
 
 /// Install a plugin from a local path.
 ///
-/// Copies the plugin directory into `~/.claude/plugins/` and returns the
+/// Copies the plugin directory into `~/.claurst/plugins/` and returns the
 /// loaded plugin name on success.
 pub fn install_plugin_from_path(
     source_path: &Path,
@@ -591,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn load_plugins_finds_project_plugin() {
         let tmp = TempDir::new().unwrap();
-        let plugin_dir = tmp.path().join(".claude").join("plugins").join("test-plugin");
+        let plugin_dir = tmp.path().join(".claurst").join("plugins").join("test-plugin");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         write_manifest(
             &plugin_dir,

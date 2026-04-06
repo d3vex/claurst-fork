@@ -3,7 +3,7 @@
 // A focused overlay with toggle-style controls for privacy preferences.
 // Opened by /privacy-settings. Changes are persisted via Settings::save_sync().
 
-use cc_core::config::Settings;
+use claurst_core::config::Settings;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -50,15 +50,23 @@ impl PrivacyScreen {
     }
 
     pub fn select_prev(&mut self) {
-        if self.selected_idx > 0 {
+        let count = self.toggles.len();
+        if count == 0 {
+            return;
+        }
+        if self.selected_idx == 0 {
+            self.selected_idx = count - 1;
+        } else {
             self.selected_idx -= 1;
         }
     }
 
     pub fn select_next(&mut self) {
-        if self.selected_idx + 1 < self.toggles.len() {
-            self.selected_idx += 1;
+        let count = self.toggles.len();
+        if count == 0 {
+            return;
         }
+        self.selected_idx = (self.selected_idx + 1) % count;
     }
 
     /// Toggle the currently selected privacy option.
@@ -102,13 +110,13 @@ fn default_toggles() -> Vec<PrivacyToggle> {
             key: "usage_sharing",
             label: "Usage Sharing",
             description: "Share aggregate usage patterns (no personal data) to help \
-                          Anthropic understand how Claude Code is used.",
+                          Anthropic understand how Claurst is used.",
             enabled: false,
         },
         PrivacyToggle {
             key: "api_request_logging",
             label: "API Request Logging",
-            description: "Log API requests to a local file (~/.claude/api_requests.log) \
+            description: "Log API requests to a local file (~/.claurst/api_requests.log) \
                           for debugging. Logs are stored locally only.",
             enabled: false,
         },

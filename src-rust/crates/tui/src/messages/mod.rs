@@ -7,7 +7,10 @@
 
 use std::collections::HashMap;
 
-use cc_core::types::{ContentBlock, Message, Role, ToolResultContent};
+use claurst_core::types::{ContentBlock, Message, Role, ToolResultContent};
+use crate::app::TurnMetadata;
+use crate::kitty_image::render_image;
+use crate::transcript_turn::reasoning_heading;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -16,6 +19,12 @@ use unicode_width::UnicodeWidthStr;
 
 mod markdown;
 pub use markdown::render_markdown;
+
+mod markdown_enhanced;
+pub use markdown_enhanced::{
+    detect_table, render_table, parse_inline_formatting,
+    Table, TableAlignment,
+};
 
 /// Context passed to all renderers.
 pub struct RenderContext {
@@ -53,6 +62,11 @@ const TRUNCATE_USER_PROMPT_TAIL_CHARS: usize = 2_500;
 
 /// Claude orange: Rgb(215, 119, 87)
 const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
+const TRANSCRIPT_USER_BG: Color = Color::Rgb(23, 23, 31);
+const TRANSCRIPT_CHIP_BG: Color = Color::Rgb(31, 31, 41);
+const TRANSCRIPT_TEXT: Color = Color::Rgb(236, 236, 241);
+const TRANSCRIPT_MUTED: Color = Color::Rgb(139, 139, 153);
+const TRANSCRIPT_SUBTLE: Color = Color::Rgb(112, 112, 126);
 
 const TOOL_RESULT_MAX_LINES: usize = 30;
 
@@ -61,12 +75,19 @@ const TOOL_RESULT_MAX_LINES: usize = 30;
 pub fn render_code_block(lang: Option<&str>, code: &str, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let label = lang.unwrap_or("code");
+    // Language label in brackets at the top
     lines.push(Line::from(vec![Span::styled(
-        format!("--- {} ", label),
-        Style::default().fg(Color::DarkGray),
+        format!("  [{lang_name}]", lang_name = label),
+        Style::default()
+            .fg(Color::Rgb(150, 150, 150))
+            .add_modifier(Modifier::DIM),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        "  ┌─────────────────────────────────────────────────".to_string(),
+        Style::default().fg(Color::Rgb(100, 100, 100)),
     )]));
     // `2` chars for the leading "  " indent; at least 10 chars of content
-    let max_content = (width as usize).saturating_sub(2).max(10);
+    let max_content = (width as usize).saturating_sub(4).max(10);
     for line in code.lines() {
         let display: String = if line.chars().count() > max_content {
             let truncated: String = line.chars().take(max_content.saturating_sub(1)).collect();
@@ -75,13 +96,13 @@ pub fn render_code_block(lang: Option<&str>, code: &str, width: u16) -> Vec<Line
             line.to_string()
         };
         lines.push(Line::from(vec![
-            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  │ ", Style::default().fg(Color::Rgb(100, 100, 100))),
             Span::styled(display, Style::default().fg(Color::White)),
         ]));
     }
     lines.push(Line::from(vec![Span::styled(
-        "----------------".to_string(),
-        Style::default().fg(Color::DarkGray),
+        "  └─────────────────────────────────────────────────".to_string(),
+        Style::default().fg(Color::Rgb(100, 100, 100)),
     )]));
     lines
 }
@@ -102,8 +123,491 @@ pub fn render_user_text(text: &str) -> Vec<Line<'static>> {
     render_user_text_with_ctx(text, &RenderContext::default())
 }
 
+fn indent_line(
+    mut line: Line<'static>,
+    prefix: &str,
+    prefix_style: Style,
+    default_fg: Color,
+) -> Line<'static> {
+    for span in &mut line.spans {
+        if span.style.fg.is_none() {
+            span.style = span.style.fg(default_fg);
+        }
+    }
+
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::styled(prefix.to_string(), prefix_style));
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+fn indent_lines(
+    lines: Vec<Line<'static>>,
+    prefix: &str,
+    prefix_style: Style,
+    default_fg: Color,
+) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| indent_line(line, prefix, prefix_style, default_fg))
+        .collect()
+}
+
+fn apply_block_style(mut line: Line<'static>, width: u16) -> Line<'static> {
+    let bg = TRANSCRIPT_USER_BG;
+    for span in &mut line.spans {
+        if span.style.fg.is_none() {
+            span.style = span.style.fg(TRANSCRIPT_TEXT);
+        }
+        span.style = span.style.bg(bg);
+    }
+
+    let mut spans = vec![
+        Span::styled("▏", Style::default().fg(CLAUDE_ORANGE).bg(bg)),
+        Span::styled(" ", Style::default().bg(bg)),
+    ];
+    spans.extend(line.spans);
+
+    let used = spans.iter().map(|span| span.content.width()).sum::<usize>();
+    if used < width as usize {
+        spans.push(Span::styled(
+            " ".repeat(width as usize - used),
+            Style::default().bg(bg),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+fn empty_block_line(width: u16) -> Line<'static> {
+    apply_block_style(Line::from(""), width)
+}
+
+fn short_model_name(model: &str) -> String {
+    model
+        .split_once('/')
+        .map(|(_, model)| model)
+        .unwrap_or(model)
+        .to_string()
+}
+
+fn title_case_mode(mode: &str) -> String {
+    let mut chars = mode.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+fn render_attachment_chip(kind: &str, label: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" {} ", kind),
+            Style::default()
+                .fg(Color::Black)
+                .bg(CLAUDE_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {} ", label),
+            Style::default().fg(TRANSCRIPT_MUTED).bg(TRANSCRIPT_CHIP_BG),
+        ),
+    ])
+}
+
+fn user_metadata_line(_meta: Option<&TurnMetadata>) -> Option<Line<'static>> {
+    // User prompt line has no metadata — mode/model/duration are shown on the
+    // assistant footer instead (matching OpenCode's layout).
+    None
+}
+
+pub fn render_transcript_assistant_meta(meta: Option<&TurnMetadata>, accent: Color) -> Option<Line<'static>> {
+    let meta = meta?;
+
+    // Always show at least mode — matches OpenCode's "Build · Model · Duration"
+    let mode = meta
+        .agent_mode
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .map(title_case_mode)
+        .unwrap_or_else(|| "Build".to_string());
+
+    let mut spans = vec![
+        Span::styled(
+            "   \u{25a3} ",
+            Style::default()
+                .fg(accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(mode, Style::default().fg(TRANSCRIPT_TEXT)),
+    ];
+
+    if let Some(model) = meta.model_name.as_deref().filter(|m| !m.is_empty()) {
+        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
+        spans.push(Span::styled(
+            short_model_name(model),
+            Style::default().fg(TRANSCRIPT_MUTED),
+        ));
+    }
+
+    if let Some(duration) = meta.duration.as_deref().filter(|d| !d.is_empty()) {
+        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
+        spans.push(Span::styled(
+            duration.to_string(),
+            Style::default().fg(TRANSCRIPT_MUTED),
+        ));
+    }
+
+    if meta.interrupted {
+        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
+        spans.push(Span::styled(
+            "interrupted",
+            Style::default().fg(TRANSCRIPT_MUTED),
+        ));
+    }
+
+    Some(Line::from(spans))
+}
+
+pub fn render_transcript_live_text(text: &str, width: u16) -> Vec<Line<'static>> {
+    indent_lines(
+        render_markdown(text, width.saturating_sub(4)),
+        "   ",
+        Style::default(),
+        TRANSCRIPT_TEXT,
+    )
+}
+
+pub fn render_transcript_user_message(
+    msg: &Message,
+    meta: Option<&TurnMetadata>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let inner_width = width.saturating_sub(4).max(10);
+    let mut lines = Vec::new();
+    let mut pending_text = String::new();
+
+    let flush_text = |buffer: &mut String, target: &mut Vec<Line<'static>>| {
+        if buffer.is_empty() {
+            return;
+        }
+        target.extend(render_user_text_with_ctx(buffer, &RenderContext {
+            width: inner_width,
+            ..RenderContext::default()
+        }));
+        buffer.clear();
+    };
+
+    for block in msg.content_blocks() {
+        match block {
+            ContentBlock::Text { text } => {
+                if !pending_text.is_empty() {
+                    pending_text.push('\n');
+                }
+                pending_text.push_str(&text);
+            }
+            ContentBlock::Image { source } => {
+                flush_text(&mut pending_text, &mut lines);
+                let label = source
+                    .media_type
+                    .or(source.url)
+                    .unwrap_or_else(|| "pasted image".to_string());
+                lines.push(render_attachment_chip("img", label));
+            }
+            ContentBlock::Document { title, context, source, .. } => {
+                flush_text(&mut pending_text, &mut lines);
+                let label = title
+                    .or(context)
+                    .or(source.url)
+                    .or(source.media_type)
+                    .unwrap_or_else(|| "attached document".to_string());
+                lines.push(render_attachment_chip("doc", label));
+            }
+            ContentBlock::UserLocalCommandOutput { command, output } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(render_user_local_command_output(&command, &output, 30));
+            }
+            ContentBlock::UserCommand { name, args } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(render_user_command(&name, &args));
+            }
+            ContentBlock::UserMemoryInput { key, value } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(render_user_memory_input(&key, &value));
+            }
+            ContentBlock::SystemAPIError { message, retry_secs } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(render_system_api_error(&message, retry_secs));
+            }
+            ContentBlock::CollapsedReadSearch { tool_name, paths, n_hidden } => {
+                flush_text(&mut pending_text, &mut lines);
+                let path_refs: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
+                lines.extend(render_collapsed_read_search(&tool_name, &path_refs, n_hidden));
+            }
+            ContentBlock::TaskAssignment { id, subject, description } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(render_task_assignment(&id, &subject, &description));
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(render_tool_use_inner(&name, &input));
+            }
+            ContentBlock::ToolResult { tool_use_id: _, content, is_error } => {
+                flush_text(&mut pending_text, &mut lines);
+                let text = tool_result_text(&content);
+                let rendered = if is_error.unwrap_or(false) {
+                    render_tool_result_error(&text)
+                } else {
+                    render_tool_result_success(&text, false)
+                };
+                lines.extend(rendered);
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(render_transcript_reasoning_block(&thinking, false, inner_width));
+            }
+            ContentBlock::RedactedThinking { .. } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.push(Line::from(vec![Span::styled(
+                    "Thinking hidden".to_string(),
+                    Style::default()
+                        .fg(TRANSCRIPT_MUTED)
+                        .add_modifier(Modifier::ITALIC),
+                )]));
+            }
+        }
+    }
+    flush_text(&mut pending_text, &mut lines);
+
+    if let Some(meta_line) = user_metadata_line(meta) {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(meta_line);
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    let mut wrapped = Vec::with_capacity(lines.len() + 2);
+    wrapped.push(empty_block_line(width));
+    wrapped.extend(lines.into_iter().map(|line| apply_block_style(line, width)));
+    wrapped.push(empty_block_line(width));
+    wrapped
+}
+
+pub fn render_transcript_reasoning_block(
+    text: &str,
+    expanded: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let heading = reasoning_heading(text).unwrap_or_else(|| "Thinking".to_string());
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Thinking: ",
+            Style::default()
+                .fg(TRANSCRIPT_MUTED)
+                .add_modifier(Modifier::ITALIC),
+        ),
+        Span::styled(
+            heading,
+            Style::default()
+                .fg(TRANSCRIPT_SUBTLE)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ]));
+
+    if expanded {
+        let rendered = render_markdown(text, width.saturating_sub(6));
+        lines.extend(indent_lines(
+            rendered,
+            "    ",
+            Style::default(),
+            TRANSCRIPT_MUTED,
+        ));
+    }
+
+    lines
+}
+
+pub fn render_transcript_assistant_message(
+    msg: &Message,
+    ctx: &RenderContext,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut pending_text = String::new();
+
+    let flush_text = |buffer: &mut String, target: &mut Vec<Line<'static>>| {
+        if buffer.is_empty() {
+            return;
+        }
+        target.extend(render_transcript_live_text(buffer, ctx.width));
+        buffer.clear();
+    };
+
+    for block in msg.content_blocks() {
+        match block {
+            ContentBlock::Text { text } => {
+                if !pending_text.is_empty() {
+                    pending_text.push('\n');
+                }
+                pending_text.push_str(&text);
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                flush_text(&mut pending_text, &mut lines);
+                let thinking_hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    thinking.hash(&mut h);
+                    h.finish()
+                };
+                let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
+                lines.extend(render_transcript_reasoning_block(&thinking, expanded, ctx.width));
+            }
+            ContentBlock::RedactedThinking { .. } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.push(Line::from(vec![Span::styled(
+                    "  Thinking hidden".to_string(),
+                    Style::default()
+                        .fg(TRANSCRIPT_MUTED)
+                        .add_modifier(Modifier::ITALIC),
+                )]));
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(indent_lines(
+                    render_tool_use_inner(&name, &input),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                flush_text(&mut pending_text, &mut lines);
+                let text = tool_result_text(&content);
+                let tool_name = ctx.tool_names.get(&tool_use_id).map(|name| name.as_str());
+                let rendered = if is_error.unwrap_or(false) {
+                    render_tool_result_error(&text)
+                } else {
+                    match tool_name {
+                        Some("Bash") | Some("PowerShell") => render_bash_output_block(&text, TOOL_RESULT_MAX_LINES),
+                        Some("Read") => render_file_read_result(&text),
+                        Some("Edit") => render_file_op_result(false),
+                        Some("Write") => render_file_op_result(true),
+                        _ => render_tool_result_success(&text, false),
+                    }
+                };
+                lines.extend(indent_lines(
+                    rendered,
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+            ContentBlock::Image { source } => {
+                flush_text(&mut pending_text, &mut lines);
+                let label = render_image(&source).unwrap_or_else(|| {
+                    source
+                        .media_type
+                        .or(source.url)
+                        .unwrap_or_else(|| "assistant image".to_string())
+                });
+                lines.extend(indent_lines(
+                    vec![render_attachment_chip("img", label)],
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+            ContentBlock::Document { title, context, source, .. } => {
+                flush_text(&mut pending_text, &mut lines);
+                let label = title
+                    .or(context)
+                    .or(source.url)
+                    .or(source.media_type)
+                    .unwrap_or_else(|| "attached document".to_string());
+                lines.extend(indent_lines(
+                    vec![render_attachment_chip("doc", label)],
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+            ContentBlock::UserLocalCommandOutput { command, output } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(indent_lines(
+                    render_user_local_command_output(&command, &output, 30),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+            ContentBlock::UserCommand { name, args } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(indent_lines(
+                    render_user_command(&name, &args),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+            ContentBlock::UserMemoryInput { key, value } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(indent_lines(
+                    render_user_memory_input(&key, &value),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+            ContentBlock::SystemAPIError { message, retry_secs } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(indent_lines(
+                    render_system_api_error(&message, retry_secs),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+            ContentBlock::CollapsedReadSearch { tool_name, paths, n_hidden } => {
+                flush_text(&mut pending_text, &mut lines);
+                let path_refs: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
+                lines.extend(indent_lines(
+                    render_collapsed_read_search(&tool_name, &path_refs, n_hidden),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+            ContentBlock::TaskAssignment { id, subject, description } => {
+                flush_text(&mut pending_text, &mut lines);
+                lines.extend(indent_lines(
+                    render_task_assignment(&id, &subject, &description),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ));
+            }
+        }
+    }
+
+    flush_text(&mut pending_text, &mut lines);
+    lines
+}
+
 /// Extract a short one-line summary of a tool call's arguments.
 /// Used by both the transcript renderer and live tool block renderer in render.rs.
+fn title_case_word(label: &str) -> String {
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
 pub fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> String {
     fn str_field<'a>(input: &'a serde_json::Value, key: &str) -> &'a str {
         input.get(key).and_then(|v| v.as_str()).unwrap_or("")
@@ -117,19 +621,19 @@ pub fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> Strin
             s.to_string()
         }
     }
-    match tool_name {
-        "Bash" | "PowerShell" => {
+    match tool_name.to_ascii_lowercase().as_str() {
+        "bash" | "powershell" => {
             let cmd = str_field(input, "command");
             truncate(cmd.lines().next().unwrap_or(""), 60)
         }
-        "Read" => truncate(str_field(input, "file_path"), 60),
-        "Edit" => truncate(str_field(input, "file_path"), 60),
-        "Write" => truncate(str_field(input, "file_path"), 60),
-        "Glob" => truncate(str_field(input, "pattern"), 60),
-        "Grep" => truncate(str_field(input, "pattern"), 60),
-        "WebFetch" => truncate(str_field(input, "url"), 60),
-        "WebSearch" => truncate(str_field(input, "query"), 60),
-        "Agent" => {
+        "read" => truncate(str_field(input, "file_path"), 60),
+        "edit" => truncate(str_field(input, "file_path"), 60),
+        "write" => truncate(str_field(input, "file_path"), 60),
+        "glob" => truncate(str_field(input, "pattern"), 60),
+        "grep" => truncate(str_field(input, "pattern"), 60),
+        "webfetch" => truncate(str_field(input, "url"), 60),
+        "websearch" => truncate(str_field(input, "query"), 60),
+        "task" | "agent" => {
             let task = str_field(input, "task");
             let task = if task.is_empty() { str_field(input, "description") } else { task };
             truncate(task.lines().next().unwrap_or(""), 60)
@@ -148,8 +652,17 @@ pub fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> Strin
     }
 }
 
-/// Render a tool-use block matching the TS AssistantToolUseMessage style:
-/// `● ToolName (summary)` header, tool-specific body, `(ctrl+o to expand)` hint.
+pub fn subagent_title(input: &serde_json::Value) -> String {
+    let label = input
+        .get("subagent_type")
+        .and_then(|value| value.as_str())
+        .map(title_case_word)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "General".to_string());
+    format!("{label} agent")
+}
+
+/// Render a compact tool-use block that matches the newer transcript language.
 pub fn render_tool_use(tool_name: &str, input_json: &str) -> Vec<Line<'static>> {
     let input: serde_json::Value =
         serde_json::from_str(input_json).unwrap_or(serde_json::Value::Null);
@@ -159,28 +672,50 @@ pub fn render_tool_use(tool_name: &str, input_json: &str) -> Vec<Line<'static>> 
 fn render_tool_use_inner(tool_name: &str, input: &serde_json::Value) -> Vec<Line<'static>> {
     let summary = extract_tool_summary(tool_name, input);
     let mut lines = Vec::new();
+    let title = match tool_name.to_ascii_lowercase().as_str() {
+        "bash" | "powershell" => "Running command",
+        "read" => "Reading file",
+        "write" => "Writing file",
+        "edit" => "Editing file",
+        "glob" | "list" => "Listing files",
+        "grep" => "Searching code",
+        "webfetch" => "Fetching page",
+        "websearch" => "Searching web",
+        "task" | "agent" => return {
+            let mut task_lines = Vec::new();
+            task_lines.push(Line::from(vec![
+                Span::styled("  ~ ".to_string(), Style::default().fg(CLAUDE_ORANGE)),
+                Span::styled(
+                    subagent_title(input),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            if !summary.is_empty() {
+                task_lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(summary, Style::default().fg(TRANSCRIPT_MUTED)),
+                ]));
+            }
+            task_lines
+        },
+        _ => tool_name,
+    };
 
-    // Header: ● ToolName (summary)
-    let mut header_spans = vec![
+    lines.push(Line::from(vec![
+        Span::styled("  ~ ".to_string(), Style::default().fg(CLAUDE_ORANGE)),
         Span::styled(
-            "  \u{25cf} ".to_string(),
-            Style::default().fg(Color::Green),
-        ),
-        Span::styled(
-            tool_name.to_string(),
+            title.to_string(),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
-    ];
+    ]));
     if !summary.is_empty() {
-        header_spans.push(Span::styled(
-            format!(" ({})", summary),
-            Style::default().fg(Color::DarkGray),
-        ));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(summary, Style::default().fg(TRANSCRIPT_MUTED)),
+        ]));
     }
-    lines.push(Line::from(header_spans));
 
-    // Tool-specific body
-    if tool_name == "Bash" || tool_name == "PowerShell" {
+    if matches!(tool_name.to_ascii_lowercase().as_str(), "bash" | "powershell") {
         let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
         for (i, cmd_line) in command.lines().enumerate() {
             if i >= 2 {
@@ -204,14 +739,6 @@ fn render_tool_use_inner(tool_name: &str, input: &serde_json::Value) -> Vec<Line
             ]));
         }
     }
-
-    // (ctrl+o to expand) hint
-    lines.push(Line::from(vec![Span::styled(
-        "  (ctrl+o to expand)".to_string(),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    )]));
 
     lines
 }
@@ -255,7 +782,7 @@ pub fn render_tool_result_success(output: &str, truncated: bool) -> Vec<Line<'st
     if total_lines > TOOL_RESULT_MAX_LINES {
         let remaining = total_lines - TOOL_RESULT_MAX_LINES;
         lines.push(Line::from(vec![Span::styled(
-            format!("  ... {} more lines  (ctrl+o to expand)", remaining),
+            format!("  ... {} more lines", remaining),
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
         )]));
     }
@@ -271,14 +798,16 @@ pub fn render_tool_result_success(output: &str, truncated: bool) -> Vec<Line<'st
 /// Render a tool result (error variant).
 pub fn render_tool_result_error(error: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    // Use orange instead of red for color-blind accessibility
+    let error_color = Color::Rgb(255, 140, 0);  // Orange
     lines.push(Line::from(vec![Span::styled(
-        "x Error",
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "  Error",
+        Style::default().fg(error_color).add_modifier(Modifier::BOLD),
     )]));
     for line in error.lines().take(10) {
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(line.to_string(), Style::default().fg(Color::Red)),
+            Span::styled(line.to_string(), Style::default().fg(error_color)),
         ]));
     }
     lines
@@ -514,22 +1043,25 @@ pub fn render_system_message(text: &str) -> Vec<Line<'static>> {
 
 /// Render a thinking block (collapsible - show header only when collapsed).
 pub fn render_thinking_block(text: &str, expanded: bool) -> Vec<Line<'static>> {
-    if !expanded {
-        return vec![Line::from(vec![Span::styled(
-            "> Thinking",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        )])];
-    }
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![Span::styled(
-        "v Thinking",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-    )]));
-    for line in text.lines() {
-        lines.push(Line::from(vec![
-            Span::styled("  | ", Style::default().fg(Color::DarkGray)),
-            Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
-        ]));
+    let heading = reasoning_heading(text).unwrap_or_else(|| "Thinking".to_string());
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Thinking: ",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ),
+        Span::styled(
+            heading,
+            Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+        ),
+    ]));
+    if expanded {
+        for line in text.lines() {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(line.to_string(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
     }
     lines
 }
@@ -612,17 +1144,19 @@ fn prefix_message_lines(
             Style::default().fg(Color::White),
         ),
         Role::Assistant => (
-            "\u{2022} ",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            "",
+            Style::default(),
             Style::default().fg(Color::White),
         ),
     };
 
-    if let Some(first) = rendered.first_mut() {
-        let mut spans = Vec::with_capacity(first.spans.len() + 1);
-        spans.push(Span::styled(prefix.to_string(), prefix_style));
-        spans.extend(first.spans.clone());
-        first.spans = spans;
+    if !prefix.is_empty() {
+        if let Some(first) = rendered.first_mut() {
+            let mut spans = Vec::with_capacity(first.spans.len() + 1);
+            spans.push(Span::styled(prefix.to_string(), prefix_style));
+            spans.extend(first.spans.clone());
+            first.spans = spans;
+        }
     }
 
     if *role == Role::User {
@@ -765,16 +1299,19 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
             }
             ContentBlock::Image { source } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
-                let label = source
-                    .url
-                    .clone()
-                    .or(source.media_type.clone())
-                    .unwrap_or_else(|| "embedded image".to_string());
-                lines.extend(prefix_message_lines(
-                    render_attachment_line("Image", label),
-                    &msg.role,
-                    ctx.width,
-                ));
+                // Attempt Kitty graphics protocol rendering.  When the
+                // terminal supports it and the source carries inline base64
+                // data, `render_image` emits the APC escape sequence directly
+                // to stdout and returns `None` — nothing more to do for this
+                // block.  Otherwise it returns a human-readable fallback
+                // string that we display as a normal styled line.
+                if let Some(label) = render_image(&source) {
+                    lines.extend(prefix_message_lines(
+                        render_attachment_line("Image", label),
+                        &msg.role,
+                        ctx.width,
+                    ));
+                }
             }
             ContentBlock::Document { title, context, source, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
@@ -966,34 +1503,34 @@ pub fn render_collapsed_read_search(
     vec![Line::from(spans)]
 }
 
-/// Render a task assignment block with a cyan border.
-/// Header: `Task #{id}` in cyan bold, subject in white bold, description lines in gray (up to 5).
+/// Render a transcript task assignment row using the same structured title/subtitle language.
 pub fn render_task_assignment(id: &str, subject: &str, desc: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![Span::styled(
-        "\u{250c}\u{2500} Task #".to_string() + id + " ",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )]));
+    let title = if subject.trim().is_empty() {
+        "Assigned task"
+    } else {
+        subject.trim()
+    };
     lines.push(Line::from(vec![
-        Span::styled("\u{2502} ", Style::default().fg(Color::Cyan)),
+        Span::styled("  ~ ", Style::default().fg(CLAUDE_ORANGE)),
         Span::styled(
-            subject.to_string(),
+            title.to_string(),
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · task #{}", id),
+            Style::default().fg(TRANSCRIPT_MUTED),
         ),
     ]));
     for line in desc.lines().take(5) {
         lines.push(Line::from(vec![
-            Span::styled("\u{2502} ", Style::default().fg(Color::Cyan)),
+            Span::raw("    "),
             Span::styled(
-                format!("  {}", line),
-                Style::default().fg(Color::Gray),
+                line.to_string(),
+                Style::default().fg(TRANSCRIPT_MUTED),
             ),
         ]));
     }
-    lines.push(Line::from(vec![Span::styled(
-        "\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-        Style::default().fg(Color::Cyan),
-    )]));
     lines
 }
 
@@ -1072,7 +1609,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("\u{2022} "));
+        assert!(!rendered.contains("◆"));
         assert!(rendered.contains("Thinking"));
         assert!(rendered.contains("read_file"));
         // ToolResult now shows output directly (no "Result" header)
@@ -1241,13 +1778,12 @@ mod tests {
         // 30 content lines + 1 overflow indicator = 31 (no separate header line)
         assert_eq!(result.len(), 31);
         let overflow_text = line_text(result.last().unwrap());
-        assert!(overflow_text.contains("expand"));
+        assert!(overflow_text.contains("more lines"));
+        assert!(!overflow_text.contains("ctrl+o"));
     }
 
     #[test]
-    fn bash_tool_use_shows_bullet_header_and_command() {
-        // New TS-style: all tools show ● ToolName (summary) header.
-        // Bash also shows "$ command" body line.
+    fn bash_tool_use_shows_running_command_title_and_command() {
         let msg = Message::assistant_blocks(vec![ContentBlock::ToolUse {
             id: "tu-1".to_string(),
             name: "Bash".to_string(),
@@ -1259,14 +1795,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("ls -la"), "command should appear in output");
-        assert!(rendered.contains("Bash"), "tool name should appear in header");
-        assert!(!rendered.contains("* Bash"), "old generic header must not appear");
-        assert!(rendered.contains("ctrl+o"), "(ctrl+o to expand) hint should appear");
+        assert!(rendered.contains("Running command"), "updated tool title should appear");
+        assert!(!rendered.contains("ctrl+o"), "legacy expansion hint should be removed");
     }
 
     #[test]
-    fn non_bash_tool_use_shows_bullet_header_with_summary() {
-        // Non-Bash tools show ● ToolName (file_path) header + ctrl+o hint.
+    fn non_bash_tool_use_shows_reading_file_title_with_summary() {
         let msg = Message::assistant_blocks(vec![ContentBlock::ToolUse {
             id: "tu-2".to_string(),
             name: "Read".to_string(),
@@ -1277,9 +1811,28 @@ mod tests {
             .map(|l| line_text(&l))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Read"), "tool name should appear");
+        assert!(rendered.contains("Reading file"), "tool title should appear");
         assert!(rendered.contains("foo.txt"), "file path summary should appear");
-        assert!(rendered.contains("ctrl+o"), "(ctrl+o to expand) hint should appear");
+        assert!(!rendered.contains("ctrl+o"), "legacy expansion hint should be removed");
+    }
+
+    #[test]
+    fn task_tool_use_shows_subagent_title_and_description() {
+        let msg = Message::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: "tu-3".to_string(),
+            name: "Task".to_string(),
+            input: serde_json::json!({
+                "subagent_type": "explore",
+                "description": "Trace the auth flow"
+            }),
+        }]);
+        let rendered = render_message(&msg, &RenderContext::default())
+            .into_iter()
+            .map(|l| line_text(&l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Explore agent"));
+        assert!(rendered.contains("Trace the auth flow"));
     }
 
     #[test]
@@ -1362,10 +1915,10 @@ mod tests {
 
     #[test]
     fn test_render_user_memory_input() {
-        let result = render_user_memory_input("project", "Claude Code Rust Port");
+        let result = render_user_memory_input("project", "Claurst");
         assert_eq!(result.len(), 2);
         let first = line_text(&result[0]);
-        assert!(first.contains("# project: Claude Code Rust Port"));
+        assert!(first.contains("# project: Claurst"));
         let second = line_text(&result[1]);
         assert!(second.contains("Got it."));
     }
@@ -1429,8 +1982,8 @@ mod tests {
         let result = render_task_assignment("42", "Implement feature X", "Add the new widget system\nWith multi-line support");
         assert!(!result.is_empty());
         let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
-        assert!(combined.contains("Task #42"));
         assert!(combined.contains("Implement feature X"));
+        assert!(combined.contains("task #42"));
         assert!(combined.contains("Add the new widget system"));
     }
 

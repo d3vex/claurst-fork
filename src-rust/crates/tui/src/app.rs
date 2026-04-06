@@ -2,16 +2,18 @@
 
 use crate::bridge_state::BridgeConnectionState;
 use crate::context_viz::ContextVizState;
+use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::export_dialog::{ExportDialogState, ExportFormat};
 use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
-use crate::model_picker::{EffortLevel, ModelPickerState, FAST_MODE_MODEL};
+use crate::model_picker::{EffortLevel, ModelPickerState, is_fast_mode_model};
 use crate::session_browser::SessionBrowserState;
+use crate::tasks_overlay::TasksOverlay;
 use crate::dialogs::McpApprovalDialogState;
 use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
 use crate::notifications::{NotificationKind, NotificationQueue};
 use crate::overlays::{
-    GlobalSearchState, HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay,
+    GlobalSearchState, HelpEntry, HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay,
     RewindFlowOverlay, SelectorMessage,
 };
 use crate::plugin_views::PluginHintBanner;
@@ -22,16 +24,18 @@ use crate::settings_screen::SettingsScreen;
 use crate::stats_dialog::StatsDialogState;
 use crate::theme_screen::ThemeScreen;
 use crate::{agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentsRoute}, diff_viewer::DiffPane};
-use cc_core::config::{Config, Settings, Theme};
-use cc_core::cost::CostTracker;
-use cc_core::file_history::FileHistory;
-use cc_core::keybindings::{
+use claurst_core::config::{Config, Settings, Theme};
+use claurst_core::cost::CostTracker;
+use claurst_core::file_history::FileHistory;
+use claurst_core::keybindings::{
     KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
 };
-use cc_core::types::{Message, Role};
-use cc_query::QueryEvent;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use claurst_core::types::{ContentBlock, Message, Role};
+use claurst_query::QueryEvent;
+use claurst_tools;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
+use ratatui::style::Color;
 use ratatui::Terminal;
 use std::cell::{Cell, RefCell};
 use std::io::Stdout;
@@ -40,37 +44,45 @@ use tracing::debug;
 
 const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("advisor", "Set or unset the server-side advisor model"),
+    ("agent", "List available agents or show agent details"),
     ("agents", "Browse agent definitions and active agents"),
     ("changes", "Inspect changes from the current session"),
     ("clear", "Clear the conversation transcript"),
     ("compact", "Compact the conversation context"),
     ("config", "Open settings"),
+    ("connect", "Connect an AI provider"),
     ("context", "Show context window and rate limit usage"),
     ("copy", "Copy the last assistant response to clipboard"),
     ("cost", "Show cost breakdown"),
     ("diff", "Inspect the current git diff"),
     ("doctor", "Run diagnostics"),
     ("effort", "Set effort level (low/medium/high/max)"),
-    ("exit", "Quit Claude Code"),
+    ("exit", "Quit Claurst"),
     ("export", "Export conversation"),
     ("fast", "Toggle fast mode"),
     ("feedback", "Open session feedback survey"),
+    ("fork", "Fork session into a new branch"),
     ("heapdump", "Show process memory and diagnostic information"),
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
-    ("init", "Initialize CLAUDE.md for this project"),
+    ("init", "Initialize AGENTS.md for this project"),
     ("insights", "Generate a session analysis report with conversation statistics"),
-    ("install-slack-app", "Install the Claude Code Slack integration"),
+    ("install-slack-app", "Install the Claurst Slack integration"),
     ("keybindings", "Show keybinding configuration"),
-    ("login", "Log in to Claude"),
-    ("logout", "Log out of Claude"),
+    ("login", "Log in to Claurst"),
+    ("logout", "Log out of Claurst"),
     ("mcp", "Browse configured MCP servers"),
-    ("memory", "Browse and open CLAUDE.md memory files"),
+    ("memory", "Browse and open AGENTS.md memory files"),
     ("model", "Change the AI model"),
     ("output-style", "Toggle output style (auto/stream/verbose)"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
     ("privacy", "Open privacy settings"),
-    ("quit", "Quit Claude Code"),
+    ("providers", "List available AI providers and their status"),
+    ("caveman", "Caveman speech mode — save big token"),
+    ("rocky", "Rocky speech mode — amaze amaze amaze"),
+    ("normal", "Deactivate speech mode"),
+    ("quit", "Quit Claurst"),
+    ("refresh", "Clear saved provider auth and model caches"),
     ("rename", "Rename this session"),
     ("resume", "Resume a previous session"),
     ("review", "Review changes (git diff)"),
@@ -84,6 +96,163 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
 ];
+
+fn help_command_category(name: &str) -> &'static str {
+    match name {
+        "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
+        "changes" | "diff" | "review" | "rewind" | "export" | "copy" => "Review & History",
+        "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
+        "config" | "settings" | "theme" | "privacy" | "keybindings" | "hooks" | "mcp" => {
+            "Workspace"
+        }
+        "agent" | "agents" | "memory" | "plugin" | "feedback" | "survey" => "Tools",
+        "session" | "resume" | "rename" | "fork" | "clear" | "compact" | "quit" | "exit" => {
+            "Session"
+        }
+        _ => "Commands",
+    }
+}
+
+fn help_overlay_entries() -> Vec<HelpEntry> {
+    PROMPT_SLASH_COMMANDS
+        .iter()
+        .map(|(name, description)| HelpEntry {
+            name: (*name).to_string(),
+            aliases: String::new(),
+            description: (*description).to_string(),
+            category: help_command_category(name).to_string(),
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Provider connection helpers
+// ---------------------------------------------------------------------------
+
+/// Return the environment variable name for a given provider ID.
+#[allow(dead_code)]
+fn get_env_var_for_provider(id: &str) -> &'static str {
+    match id {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "google" | "google-vertex" => "GOOGLE_API_KEY",
+        "github-copilot" => "GITHUB_TOKEN",
+        "groq" => "GROQ_API_KEY",
+        "cerebras" => "CEREBRAS_API_KEY",
+        "sambanova" => "SAMBANOVA_API_KEY",
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "mistral" => "MISTRAL_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        "togetherai" => "TOGETHER_API_KEY",
+        "perplexity" => "PERPLEXITY_API_KEY",
+        "cohere" => "COHERE_API_KEY",
+        "xai" => "XAI_API_KEY",
+        "deepinfra" => "DEEPINFRA_API_KEY",
+        "azure" => "AZURE_API_KEY",
+        "amazon-bedrock" => "AWS_ACCESS_KEY_ID",
+        "sap-ai-core" => "AICORE_SERVICE_KEY",
+        "gitlab" => "GITLAB_TOKEN",
+        "cloudflare-ai-gateway" | "cloudflare-workers-ai" => "CLOUDFLARE_API_TOKEN",
+        "vercel" => "AI_GATEWAY_API_KEY",
+        "helicone" => "HELICONE_API_KEY",
+        "huggingface" => "HF_TOKEN",
+        "nvidia" => "NVIDIA_API_KEY",
+        "alibaba" => "DASHSCOPE_API_KEY",
+        "venice" => "VENICE_API_KEY",
+        "moonshotai" => "MOONSHOT_API_KEY",
+        "zhipuai" => "ZHIPU_API_KEY",
+        "siliconflow" => "SILICONFLOW_API_KEY",
+        "nebius" => "NEBIUS_API_KEY",
+        "novita" => "NOVITA_API_KEY",
+        "ovhcloud" => "OVHCLOUD_API_KEY",
+        "scaleway" => "SCALEWAY_API_KEY",
+        "vultr" => "VULTR_API_KEY",
+        "baseten" => "BASETEN_API_KEY",
+        "friendli" => "FRIENDLI_TOKEN",
+        "upstage" => "UPSTAGE_API_KEY",
+        "stepfun" => "STEPFUN_API_KEY",
+        "fireworks" => "FIREWORKS_API_KEY",
+        _ => "API_KEY",
+    }
+}
+
+/// Return a URL hint for obtaining an API key from a given provider.
+#[allow(dead_code)]
+fn get_url_for_provider(id: &str) -> &'static str {
+    match id {
+        "anthropic" => "console.anthropic.com",
+        "openai" => "platform.openai.com/api-keys",
+        "google" => "aistudio.google.com/apikey",
+        "github-copilot" => "github.com/settings/tokens",
+        "groq" => "console.groq.com/keys",
+        "cerebras" => "cloud.cerebras.ai",
+        "sambanova" => "cloud.sambanova.ai",
+        "deepseek" => "platform.deepseek.com/api_keys",
+        "mistral" => "console.mistral.ai/api-keys",
+        "openrouter" => "openrouter.ai/keys",
+        "togetherai" => "api.together.xyz/settings/api-keys",
+        "perplexity" => "perplexity.ai/settings/api",
+        "cohere" => "dashboard.cohere.com/api-keys",
+        "xai" => "console.x.ai",
+        "deepinfra" => "deepinfra.com/dash/api_keys",
+        "azure" => "portal.azure.com",
+        "amazon-bedrock" => "console.aws.amazon.com/bedrock",
+        "huggingface" => "huggingface.co/settings/tokens",
+        "nvidia" => "build.nvidia.com",
+        "venice" => "venice.ai/settings/api",
+        _ => "the provider's website",
+    }
+}
+
+fn provider_picker_items() -> Vec<SelectItem> {
+    vec![
+        SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "openai-codex".into(), title: "OpenAI Codex".into(), description: "(ChatGPT Plus/Pro — browser login)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "google".into(), title: "Google".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
+        SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Popular".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
+        SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
+        SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "llamacpp".into(), title: "llama.cpp".into(), description: "Local inference server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "deepseek".into(), title: "DeepSeek".into(), description: "Reasoning and coding models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "mistral".into(), title: "Mistral".into(), description: "Hosted Mistral models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "togetherai".into(), title: "Together AI".into(), description: "Open model hosting".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "perplexity".into(), title: "Perplexity".into(), description: "Search-augmented models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "cohere".into(), title: "Cohere".into(), description: "Command models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "xai".into(), title: "xAI".into(), description: "Grok models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "deepinfra".into(), title: "DeepInfra".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "azure".into(), title: "Azure OpenAI".into(), description: "Enterprise OpenAI deployments".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "amazon-bedrock".into(), title: "AWS Bedrock".into(), description: "Enterprise foundation models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "google-vertex".into(), title: "Google Vertex AI".into(), description: "Enterprise Google models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "sap-ai-core".into(), title: "SAP AI Core".into(), description: "Enterprise AI platform".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "gitlab".into(), title: "GitLab Duo".into(), description: "AI in GitLab".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "cloudflare-ai-gateway".into(), title: "Cloudflare AI Gateway".into(), description: "Gateway for multiple providers".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "cloudflare-workers-ai".into(), title: "Cloudflare Workers AI".into(), description: "Edge AI inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "helicone".into(), title: "Helicone".into(), description: "AI gateway and observability".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "huggingface".into(), title: "Hugging Face".into(), description: "Hosted community models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "nvidia".into(), title: "NVIDIA".into(), description: "Hosted NVIDIA models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "alibaba".into(), title: "Alibaba".into(), description: "Qwen and hosted models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "venice".into(), title: "Venice AI".into(), description: "Privacy-first AI".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "moonshotai".into(), title: "Moonshot AI".into(), description: "Hosted Moonshot models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "zhipuai".into(), title: "Zhipu AI".into(), description: "Hosted GLM models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "siliconflow".into(), title: "SiliconFlow".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "nebius".into(), title: "Nebius".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "novita".into(), title: "Novita".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "ovhcloud".into(), title: "OVHcloud".into(), description: "EU-hosted AI".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "scaleway".into(), title: "Scaleway".into(), description: "EU cloud AI".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "vultr".into(), title: "Vultr".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "baseten".into(), title: "Baseten".into(), description: "Model serving".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "friendli".into(), title: "Friendli".into(), description: "Serverless inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "Hosted Upstage models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "Hosted reasoning models".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "Other".into(), badge: None },
+    ]
+}
 
 // ---------------------------------------------------------------------------
 // Supporting types
@@ -120,6 +289,78 @@ pub enum DisplayMessage {
     System { text: String, style: SystemMessageStyle },
 }
 
+/// Context menu state: position and currently selected item index.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextMenuState {
+    /// X coordinate of the menu (column).
+    pub x: u16,
+    /// Y coordinate of the menu (row).
+    pub y: u16,
+    /// Currently selected menu item index (0-based).
+    pub selected_index: usize,
+    /// What the context menu is acting on.
+    pub kind: ContextMenuKind,
+}
+
+/// What content the context menu is currently targeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuKind {
+    /// A specific transcript message.
+    Message { message_index: usize },
+    /// The current text selection anywhere in the frame.
+    Selection,
+}
+
+/// Available context menu items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuItem {
+    Copy,
+    Fork,
+}
+
+/// State for the Go to Line dialog (Ctrl+G in message pane).
+#[derive(Debug, Clone)]
+pub struct GoToLineDialog {
+    /// Input field for line number.
+    pub input: String,
+    /// Whether the dialog is currently active.
+    pub active: bool,
+    /// Total number of lines (for validation feedback).
+    pub total_lines: usize,
+}
+
+impl GoToLineDialog {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            active: false,
+            total_lines: 0,
+        }
+    }
+
+    pub fn open(&mut self, total_lines: usize) {
+        self.input.clear();
+        self.active = true;
+        self.total_lines = total_lines;
+    }
+
+    pub fn close(&mut self) {
+        self.active = false;
+        self.input.clear();
+    }
+
+    /// Parse the input as a line number (1-indexed).
+    /// Returns None if invalid or out of range.
+    pub fn parse_line_number(&self) -> Option<usize> {
+        let line_num: usize = self.input.trim().parse().ok()?;
+        if line_num >= 1 && line_num <= self.total_lines {
+            Some(line_num)
+        } else {
+            None
+        }
+    }
+}
+
 /// Status of an active or completed tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolStatus {
@@ -133,10 +374,20 @@ pub enum ToolStatus {
 pub struct ToolUseBlock {
     pub id: String,
     pub name: String,
+    pub turn_index: Option<usize>,
     pub status: ToolStatus,
     pub output_preview: Option<String>,
     /// JSON-serialised input for the tool call (populated from the API stream).
     pub input_json: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TurnMetadata {
+    pub submitted_at: Option<String>,
+    pub model_name: Option<String>,
+    pub agent_mode: Option<String>,
+    pub duration: Option<String>,
+    pub interrupted: bool,
 }
 
 /// State for Ctrl+R history search mode (legacy inline struct, kept for test
@@ -190,17 +441,20 @@ impl HistorySearch {
 
 /// Attempt to copy text to the system clipboard using platform CLI tools.
 /// Returns true if successful.
-fn try_copy_to_clipboard(text: &str) -> bool {
+pub fn try_copy_to_clipboard(text: &str) -> bool {
     // Windows
     #[cfg(target_os = "windows")]
     {
         use std::io::Write;
         if let Ok(mut child) = std::process::Command::new("clip")
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
         {
-            if let Some(stdin) = child.stdin.as_mut() {
+            if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(text.as_bytes());
+                drop(stdin);
             }
             return child.wait().map(|s| s.success()).unwrap_or(false);
         }
@@ -244,34 +498,100 @@ fn try_copy_to_clipboard(text: &str) -> bool {
     false
 }
 
+/// Map a character to its QWERTY Latin keyboard-position equivalent.
+///
+/// When a modifier key (Ctrl, Alt) is held together with a non-ASCII character
+/// (e.g. Cyrillic С on a Ukrainian/Russian layout), the char produced by
+/// crossterm is the non-Latin glyph rather than the Latin letter that occupies
+/// the same physical key.  Keybinding strings are always written as Latin
+/// letters (`ctrl+c`, `alt+b`, …), so the lookup fails.
+///
+/// This function converts the reported character to the Latin letter that sits
+/// at the same physical QWERTY position, covering the standard Russian JCUKEN
+/// and Ukrainian layouts which share the same physical-key→Latin mapping.
+/// For characters outside any known mapping the original (lowercased) char is
+/// returned unchanged — this is always safe since unrecognised chars just
+/// produce no keybinding match.
+fn layout_to_latin(c: char) -> String {
+    // Standard Russian/Ukrainian JCUKEN → QWERTY position mapping.
+    // Both upper- and lower-case Cyrillic variants are covered by
+    // converting to lowercase first.
+    let lower = c.to_lowercase().next().unwrap_or(c);
+    let mapped: Option<char> = match lower {
+        // Row 1
+        'й' => Some('q'), 'ц' => Some('w'), 'у' => Some('e'),
+        'к' => Some('r'), 'е' => Some('t'), 'н' => Some('y'),
+        'г' => Some('u'), 'ш' => Some('i'), 'щ' => Some('o'),
+        'з' => Some('p'),
+        // Row 2
+        'ф' => Some('a'), 'ы' => Some('s'), 'в' => Some('d'),
+        'а' => Some('f'), 'п' => Some('g'), 'р' => Some('h'),
+        'о' => Some('j'), 'л' => Some('k'), 'д' => Some('l'),
+        // Row 3
+        'я' => Some('z'), 'ч' => Some('x'), 'с' => Some('c'),
+        'м' => Some('v'), 'и' => Some('b'), 'т' => Some('n'),
+        'ь' => Some('m'),
+        // Ukrainian-specific letters on standard positions
+        'і' => Some('s'), 'ї' => Some(']'), 'є' => Some('\''),
+        _ => None,
+    };
+    mapped.unwrap_or(lower).to_string()
+}
+
 fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt  = key.modifiers.contains(KeyModifiers::ALT);
+
     let normalized_key = match key.code {
         KeyCode::Backspace => "backspace".to_string(),
-        KeyCode::Delete => "delete".to_string(),
-        KeyCode::Down => "down".to_string(),
-        KeyCode::End => "end".to_string(),
-        KeyCode::Enter => "enter".to_string(),
-        KeyCode::Esc => "escape".to_string(),
-        KeyCode::Home => "home".to_string(),
-        KeyCode::Left => "left".to_string(),
-        KeyCode::PageDown => "pagedown".to_string(),
-        KeyCode::PageUp => "pageup".to_string(),
-        KeyCode::Right => "right".to_string(),
-        KeyCode::Tab => "tab".to_string(),
-        KeyCode::Up => "up".to_string(),
-        KeyCode::BackTab => "tab".to_string(),
+        KeyCode::Delete    => "delete".to_string(),
+        KeyCode::Down      => "down".to_string(),
+        KeyCode::End       => "end".to_string(),
+        KeyCode::Enter     => "enter".to_string(),
+        KeyCode::Esc       => "escape".to_string(),
+        KeyCode::Home      => "home".to_string(),
+        KeyCode::Left      => "left".to_string(),
+        KeyCode::PageDown  => "pagedown".to_string(),
+        KeyCode::PageUp    => "pageup".to_string(),
+        KeyCode::Right     => "right".to_string(),
+        KeyCode::Tab       => "tab".to_string(),
+        KeyCode::Up        => "up".to_string(),
+        KeyCode::BackTab   => "tab".to_string(),
         KeyCode::Char(' ') => "space".to_string(),
-        KeyCode::Char(c) => c.to_lowercase().to_string(),
+        KeyCode::Char(c) => {
+            // For modifier-key combos (Ctrl/Alt + letter), normalize to the
+            // ASCII Latin key at the same physical QWERTY position.  This
+            // makes shortcuts like Ctrl+C work regardless of the active
+            // keyboard layout (Ukrainian, Russian, Greek, …).
+            if (ctrl || alt) && !c.is_ascii() {
+                layout_to_latin(c)
+            } else {
+                c.to_lowercase().to_string()
+            }
+        }
         _ => return None,
     };
 
     Some(ParsedKeystroke {
         key: normalized_key,
-        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-        alt: key.modifiers.contains(KeyModifiers::ALT),
+        ctrl,
+        alt,
         shift: key.modifiers.contains(KeyModifiers::SHIFT),
         meta: key.modifiers.contains(KeyModifiers::SUPER),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Focus target
+// ---------------------------------------------------------------------------
+
+/// Which area of the TUI currently has keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusTarget {
+    /// Keyboard input goes to the prompt editor.
+    Input,
+    /// Keyboard input goes to the transcript/message pane (scroll, etc.).
+    Transcript,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +617,7 @@ pub struct App {
     pub scroll_offset: usize,
     pub is_streaming: bool,
     pub streaming_text: String,
+    pub streaming_thinking: String,
     pub status_message: Option<String>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
@@ -308,12 +629,29 @@ pub struct App {
     pub permission_request: Option<PermissionRequest>,
     pub frame_count: u64,
     pub token_count: u32,
+    /// Maximum token budget (from env var or model context window) — P2 feature flag
+    pub token_budget: Option<u32>,
     pub cost_usd: f64,
     pub model_name: String,
+    /// Whether the app has valid API credentials configured.
+    /// False = show the in-TUI provider setup dialog on startup.
+    pub has_credentials: bool,
     /// Current effort level (controls extended-thinking budget_tokens).
     pub effort_level: EffortLevel,
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
     pub fast_mode: bool,
+    /// Active speech mode: None = normal, Some("caveman") / Some("rocky").
+    pub speech_mode: Option<String>,
+    /// Speech mode intensity: "lite", "full", "ultra".
+    pub speech_level: String,
+    /// Current agent mode name: "build", "plan", "explore", etc.
+    pub agent_mode: Option<String>,
+    /// Accent color derived from the current agent mode.
+    /// Build = pink, Plan = blue, Explore = amber.
+    pub accent_color: Color,
+    /// Set by `cycle_agent_mode` so the main loop can update the query config
+    /// and tool list to match the newly-selected agent.
+    pub agent_mode_changed: bool,
     pub agent_status: Vec<(String, String)>,
     pub history_search: Option<HistorySearch>,
     pub keybindings: KeybindingResolver,
@@ -338,12 +676,23 @@ pub struct App {
 
     /// Instant the session started (used for elapsed-time in the status bar).
     pub session_start: std::time::Instant,
+    /// Current Rustle pose for rendering (updated each frame).
+    pub rustle_current_pose: crate::rustle::RustlePose,
+    /// Temporary Rustle pose override (e.g. look-down on Tab). Reverts to
+    /// default after this instant passes.
+    pub rustle_pose_until: Option<std::time::Instant>,
+    /// The temporary pose to show until `rustle_pose_until`.
+    pub rustle_temp_pose: Option<crate::rustle::RustlePose>,
+    /// Frame counter at which the next random eye-shift should fire.
+    pub rustle_next_blink: u64,
     /// Instant the current turn's streaming began (reset each time streaming starts).
     pub turn_start: Option<std::time::Instant>,
     /// Elapsed time string for the last completed turn, e.g. "2m 5s".
     pub last_turn_elapsed: Option<String>,
     /// Past-tense verb shown after turn completes, e.g. "Worked" / "Baked".
     pub last_turn_verb: Option<&'static str>,
+    /// Per-user turn snapshots used by the transcript renderer.
+    pub turn_metadata: Vec<TurnMetadata>,
     /// Incremented whenever transcript-visible state changes so rendering can
     /// reuse cached layout between keystrokes.
     pub transcript_version: Cell<u64>,
@@ -371,7 +720,7 @@ pub struct App {
     /// Remote session URL (set when bridge connects; readable by commands).
     pub remote_session_url: Option<String>,
     /// Live MCP manager snapshot source when available.
-    pub mcp_manager: Option<Arc<cc_mcp::McpManager>>,
+    pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
     /// Shared file-history service used for turn diff reconstruction.
@@ -406,7 +755,7 @@ pub struct App {
     pub diff_viewer: DiffViewerState,
     /// Session-quality feedback survey overlay.
     pub feedback_survey: crate::feedback_survey::FeedbackSurveyState,
-    /// Memory file selector overlay (CLAUDE.md browser).
+    /// Memory file selector overlay (AGENTS.md browser).
     pub memory_file_selector: crate::memory_file_selector::MemoryFileSelectorState,
     /// Read-only hooks configuration browser.
     pub hooks_config_menu: crate::hooks_config_menu::HooksConfigMenuState,
@@ -416,7 +765,7 @@ pub struct App {
     pub voice_mode_notice: crate::voice_mode_notice::VoiceModeNoticeState,
     /// Desktop app upsell startup dialog.
     pub desktop_upsell: crate::desktop_upsell_startup::DesktopUpsellStartupState,
-    /// Startup error dialog for malformed settings.json or CLAUDE.md.
+    /// Startup error dialog for malformed settings.json or AGENTS.md.
     pub invalid_config_dialog: crate::invalid_config_dialog::InvalidConfigDialogState,
     /// Memory update notification banner.
     pub memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState,
@@ -426,19 +775,51 @@ pub struct App {
     pub model_picker: ModelPickerState,
     /// Session browser overlay (/session, /resume, /rename, /export).
     pub session_browser: SessionBrowserState,
+    /// Session branching overlay (Ctrl+B) — create and switch branches.
+    pub session_branching: crate::session_branching::SessionBranchingState,
+    /// Task progress overlay (Ctrl+T) — shows task status with toggle capability.
+    pub tasks_overlay: TasksOverlay,
     /// Export format picker dialog (/export).
     pub export_dialog: ExportDialogState,
     /// Context window / rate limit visualization overlay (/context).
     pub context_viz: ContextVizState,
     /// MCP server approval dialog.
     pub mcp_approval: McpApprovalDialogState,
+    /// Go to Line dialog (Ctrl+G in message pane).
+    pub go_to_line_dialog: GoToLineDialog,
     /// Bypass-permissions startup confirmation dialog.
     /// Shown at startup when --dangerously-skip-permissions was passed.
     /// User must explicitly accept or the session exits.
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
     /// First-launch onboarding welcome dialog.
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
-    /// Whether Claude was launched from the user's home directory.
+    /// API key input dialog (opened from /connect for key-based providers).
+    pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
+    /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
+    pub device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState,
+    /// When set, the main loop should spawn the async auth task for this provider.
+    pub device_auth_pending: Option<String>,
+    /// Shared provider registry for dynamic model fetching.
+    pub provider_registry: Option<std::sync::Arc<claurst_api::ProviderRegistry>>,
+    /// Model registry populated from models.dev — single source of truth for
+    /// all provider models shown in the `/model` picker.
+    pub model_registry: claurst_api::ModelRegistry,
+    /// When `true`, the main event loop should spawn an async task to fetch
+    /// the model list from the current provider's `list_models()` API.
+    pub model_picker_fetch_pending: bool,
+    /// When `true`, the main event loop should spawn an async task to load
+    /// the session list from disk and populate the session browser.
+    pub session_list_pending: bool,
+    /// Receiver for background session-list results.
+    pub session_list_rx:
+        Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
+    /// Credential store for provider API keys and OAuth tokens.
+    pub auth_store: claurst_core::AuthStore,
+    /// Connect-a-provider dialog (/connect command).
+    pub connect_dialog: DialogSelectState,
+    /// Ctrl+K command palette overlay.
+    pub command_palette: DialogSelectState,
+    /// Whether Claurst was launched from the user's home directory.
     /// Shown as a startup notice: "Note: You have launched claude in your home directory…"
     pub home_dir_warning: bool,
     /// Output style: "auto" | "stream" | "verbose".
@@ -459,19 +840,22 @@ pub struct App {
     pub auto_compact_enabled: bool,
     /// Context threshold (0-100) at which to auto-compact.
     pub auto_compact_threshold: u8,
+    /// Guard to prevent re-triggering auto-compact while one is in flight.
+    pub auto_compact_running: bool,
 
     // ---- Voice hold-to-talk ------------------------------------------------
 
     /// The global voice recorder, Some when voice is enabled in config.
-    pub voice_recorder: Option<Arc<Mutex<cc_core::voice::VoiceRecorder>>>,
+    pub voice_recorder: Option<Arc<Mutex<claurst_core::voice::VoiceRecorder>>>,
     /// True while recording is active (Alt+V toggled on).
     pub voice_recording: bool,
     /// Receiver for VoiceEvent messages produced by the recorder task.
-    pub voice_event_rx: Option<tokio::sync::mpsc::Receiver<cc_core::voice::VoiceEvent>>,
+    pub voice_event_rx: Option<tokio::sync::mpsc::Receiver<claurst_core::voice::VoiceEvent>>,
     /// Receiver for model-list results fetched in the background when the
     /// /model picker opens.  Drained each frame so models appear as soon as
     /// the fetch completes.
-    pub model_fetch_rx: Option<tokio::sync::mpsc::Receiver<Vec<crate::model_picker::ModelEntry>>>,
+    pub model_fetch_rx:
+        Option<tokio::sync::mpsc::Receiver<Result<Vec<crate::model_picker::ModelEntry>, ()>>>,
 
     // ---- Context window & rate limit info ----------------------------------
 
@@ -495,10 +879,20 @@ pub struct App {
     pub thinking_expanded: std::collections::HashSet<u64>,
     /// The message pane area from the last render frame (used for mouse hit testing).
     pub last_msg_area: Cell<ratatui::layout::Rect>,
+    /// The frame region that supports text selection.
+    pub last_selectable_area: Cell<ratatui::layout::Rect>,
+    /// The prompt input area from the last render frame (used for focus routing).
+    pub last_input_area: Cell<ratatui::layout::Rect>,
+    /// Which area of the TUI currently has keyboard focus.
+    pub focus: FocusTarget,
     /// Maps virtual_row_index → thinking_block_hash for click detection.
     pub thinking_row_map: RefCell<std::collections::HashMap<u16, u64>>,
+    /// Maps screen row → transcript message index for right-click hit testing.
+    pub message_row_map: RefCell<std::collections::HashMap<u16, usize>>,
     /// Total message lines from the last render (used for virtual row mapping).
     pub total_message_lines: Cell<usize>,
+    /// Scroll offset from the last render frame (used for selection validation).
+    pub last_render_scroll_offset: Cell<u16>,
 
     // ---- Text selection state --------------------------------------------
     /// Selection drag anchor (col, row) — set on mouse-down.
@@ -507,6 +901,16 @@ pub struct App {
     pub selection_focus: Option<(u16, u16)>,
     /// Text extracted from the current selection (updated each render frame).
     pub selection_text: RefCell<String>,
+
+    // ---- Advanced mouse interaction state --------------------------------
+    /// Timestamp of the last left mouse click (for double/triple-click detection).
+    pub last_click_time: Option<std::time::Instant>,
+    /// Position of the last left mouse click (for double/triple-click detection).
+    pub last_click_position: Option<(u16, u16)>,
+    /// Count of consecutive clicks: 1 = single, 2 = double, 3+ = triple.
+    pub click_count: u32,
+    /// Context menu state: position and selected index.
+    pub context_menu_state: Option<ContextMenuState>,
 
     // ---- Scroll acceleration state (trackpad feel) -----------------------
     /// Current acceleration multiplier for scroll events.
@@ -520,6 +924,11 @@ pub struct App {
     /// Before showing the dialog for a bash command, the first whitespace-delimited
     /// word is checked against this set; a match silently auto-approves the request.
     pub bash_prefix_allowlist: std::collections::HashSet<String>,
+
+    // ---- Auto-update notification ----------------------------------------
+    /// If a newer version was found during background update check, this holds
+    /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
+    pub update_available: Option<String>,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -572,17 +981,116 @@ fn sample_completion_verb(seed: usize) -> &'static str {
     TURN_COMPLETION_VERBS[seed % TURN_COMPLETION_VERBS.len()]
 }
 
-/// Format a duration in seconds to a human-readable string, e.g. "2m 5s".
-fn format_elapsed(secs: u64) -> String {
-    if secs < 60 {
-        format!("{}s", secs)
-    } else {
-        format!("{}m {}s", secs / 60, secs % 60)
+/// Format a duration in milliseconds to a human-readable string.
+///
+/// Matches OpenCode's behaviour: rounds to whole seconds, shows "Xs" for
+/// durations under a minute, "Xm Ys" for longer ones.
+// ---------------------------------------------------------------------------
+// Speech mode prompts (caveman / rocky)
+// ---------------------------------------------------------------------------
+
+/// Return the system prompt injection for the active speech mode + level.
+pub fn speech_mode_prompt(mode: &str, level: &str) -> String {
+    match mode {
+        "caveman" => caveman_prompt(level),
+        "rocky" => rocky_prompt(level),
+        _ => String::new(),
     }
+}
+
+fn caveman_prompt(level: &str) -> String {
+    let base = "\
+OUTPUT STYLE: Concise. You are still a fully capable coding assistant. \
+Give complete, correct answers. Just use fewer words. \
+Code blocks, technical terms, error messages, file paths, and git operations are UNCHANGED.
+
+Rules for prose only:
+- Cut pleasantries, hedging, filler openers/closers
+- No 'I would be happy to', 'Let me know if', 'Hope that helps'
+- Lead with the answer or action, not the reasoning";
+
+    match level {
+        "lite" => format!("{}\n\nStrip pleasantries and hedging. Keep full grammar and articles. Just remove the fluff.", base),
+        "ultra" => format!("{}\n\nAlso drop articles (a/an/the). Compress to short imperative phrases. Numbered steps, no prose between. Absolute minimum words.", base),
+        _ => format!("{}\n\nAlso drop articles (a/an/the) and unnecessary verbs. Compress sentences but keep them readable.\n\
+Example: 'The issue is that you create a new object reference each render cycle, which triggers re-renders.' → 'New object ref each render triggers re-render. Wrap in useMemo.'", base),
+    }
+}
+
+fn rocky_prompt(level: &str) -> String {
+    let base = "\
+OUTPUT STYLE: You speak like Rocky, the Eridian alien from Project Hail Mary. \
+You are still a fully capable coding assistant — give complete, correct, useful answers. \
+Rocky is an engineering genius who happens to speak English as a second language. \
+The style is a natural byproduct of how Rocky talks, NOT a gimmick. Stay helpful.
+
+Code blocks, technical terms, error messages, file paths, and git operations are UNCHANGED.
+
+Rocky's grammar for prose:
+- Often drops articles (a/an/the) but not always — use judgment
+- Sometimes drops auxiliary verbs (is/are/was) for brevity
+- Contractions simplify: 'don't' → 'no', 'can't' → 'no can'
+- Questions end with ', question?' naturally (not forced on every single one)
+- Uses 'big' as an intensifier: 'big problem', 'big help', 'big change'
+- Uses 'good good good' or 'amaze amaze amaze' when genuinely impressed — naturally, \
+  maybe once or twice per response, not on every sentence
+- Uses 'bad bad bad' for actual problems
+- No pleasantries or filler — Rocky is direct but warm
+
+The goal: sound like Rocky while being genuinely helpful. Rocky is smart. \
+Rocky gives complete technical answers. Rocky just uses fewer unnecessary words.";
+
+    match level {
+        "lite" => format!("{}\n\nLight touch. Mostly normal English but drop pleasantries, \
+occasionally drop an article, use 'question?' on one or two questions. Subtle.", base),
+        "ultra" => format!("{}\n\nStrong Rocky voice. Drop most articles and auxiliaries. \
+Use 'big' liberally. Triple emphasis ('good good good', 'amaze amaze amaze') \
+2-3 times per response. Occasionally comment on human code patterns as fascinating. \
+Still give complete, correct technical answers.", base),
+        _ => format!("{}\n\nBalanced Rocky. Drop articles naturally, use Rocky vocabulary \
+('big', 'no can', 'question?'), triple emphasis once or twice when warranted. \
+Full technical accuracy.\n\
+Example: 'Borrow checker found mismatch. Immutable ref still live when you take mutable. \
+Move immutable borrow out of scope first, then take mutable. Good good good after fix.'", base),
+    }
+}
+
+/// Accent color for build mode (default pink).
+pub const ACCENT_BUILD: Color = Color::Rgb(233, 30, 99);
+/// Accent color for plan mode (blue).
+pub const ACCENT_PLAN: Color = Color::Rgb(66, 135, 245);
+/// Accent color for explore mode (amber).
+pub const ACCENT_EXPLORE: Color = Color::Rgb(245, 189, 66);
+
+/// Return the accent color for a given agent mode name.
+pub fn accent_for_mode(mode: Option<&str>) -> Color {
+    match mode {
+        Some("plan") => ACCENT_PLAN,
+        Some("explore") => ACCENT_EXPLORE,
+        _ => ACCENT_BUILD,
+    }
+}
+
+fn format_elapsed_ms(ms: u128) -> String {
+    let total_secs = ((ms + 500) / 1000) as u64; // round to nearest second
+    if total_secs < 60 {
+        format!("{}s", total_secs)
+    } else {
+        format!("{}m {}s", total_secs / 60, total_secs % 60)
+    }
+}
+
+fn format_turn_time_label() -> String {
+    chrono::Local::now()
+        .format("%I:%M %p")
+        .to_string()
+        .trim_start_matches('0')
+        .to_lowercase()
 }
 
 impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
+        let config = config;
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
         Self {
@@ -598,6 +1106,7 @@ impl App {
             scroll_offset: 0,
             is_streaming: false,
             streaming_text: String::new(),
+            streaming_thinking: String::new(),
             status_message: None,
             spinner_verb: None,
             should_quit: false,
@@ -606,10 +1115,17 @@ impl App {
             permission_request: None,
             frame_count: 0,
             token_count: 0,
+            token_budget: Self::load_token_budget(),
             cost_usd: 0.0,
             model_name,
+            has_credentials: true, // overridden by caller when no key is configured
             effort_level: EffortLevel::Normal,
             fast_mode: false,
+            speech_mode: None,
+            speech_level: "full".to_string(),
+            agent_mode: None,
+            agent_mode_changed: false,
+            accent_color: ACCENT_BUILD,
             agent_status: Vec::new(),
             history_search: None,
             keybindings: KeybindingResolver::new(&user_keybindings),
@@ -618,11 +1134,23 @@ impl App {
             new_messages_while_scrolled: 0,
             token_warning_threshold_shown: 0,
             session_start: std::time::Instant::now(),
+            rustle_current_pose: crate::rustle::RustlePose::Default,
+            rustle_pose_until: None,
+            rustle_temp_pose: None,
+            rustle_next_blink: 200 + (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64 % 300),
             turn_start: None,
             last_turn_elapsed: None,
             last_turn_verb: None,
+            turn_metadata: Vec::new(),
             transcript_version: Cell::new(0),
-            help_overlay: HelpOverlay::new(),
+            help_overlay: {
+                let mut overlay = HelpOverlay::new();
+                overlay.populate_from_commands(help_overlay_entries());
+                overlay
+            },
             history_search_overlay: HistorySearchOverlay::new(),
             global_search: GlobalSearchState::default(),
             message_selector: MessageSelectorOverlay::new(),
@@ -657,11 +1185,46 @@ impl App {
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
             model_picker: ModelPickerState::new(),
             session_browser: SessionBrowserState::new(),
+            session_branching: crate::session_branching::SessionBranchingState::new(),
+            tasks_overlay: TasksOverlay::new(),
             export_dialog: ExportDialogState::new(),
             context_viz: ContextVizState::new(),
             mcp_approval: McpApprovalDialogState::new(),
+            go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
+            key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
+            device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
+            device_auth_pending: None,
+            provider_registry: None,
+            model_registry: {
+                let mut reg = claurst_api::ModelRegistry::new();
+                // Try to load cached models.dev data from disk.
+                let cache_path = dirs::cache_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("claurst")
+                    .join("models.json");
+                reg.load_cache(&cache_path);
+                reg
+            },
+            model_picker_fetch_pending: false,
+            session_list_pending: false,
+            session_list_rx: None,
+            auth_store: claurst_core::AuthStore::load(),
+            connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
+            command_palette: {
+                let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
+                    .iter()
+                    .map(|(name, desc)| SelectItem {
+                        id: format!("/{}", name),
+                        title: format!("/{}", name),
+                        description: desc.to_string(),
+                        category: "Commands".to_string(),
+                        badge: None,
+                    })
+                    .collect();
+                DialogSelectState::new("Command Palette", items)
+            },
             home_dir_warning: false,
             output_style: "auto".to_string(),
             pr_number: None,
@@ -672,15 +1235,16 @@ impl App {
             status_line_override: None,
             auto_compact_enabled: false,
             auto_compact_threshold: 95,
+            auto_compact_running: false,
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
-                // (stored in ~/.claude/ui-settings.json).  We also accept
-                // CLAUDE_CODE_VOICE_ENABLED=1 as an override for easier testing.
-                let voice_on = std::env::var("CLAUDE_CODE_VOICE_ENABLED")
+                // (stored in ~/.claurst/ui-settings.json).  We also accept
+                // CLAURST_VOICE_ENABLED=1 as an override for easier testing.
+                let voice_on = std::env::var("CLAURST_VOICE_ENABLED")
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false)
                     || {
-                        let path = cc_core::config::Settings::config_dir()
+                        let path = claurst_core::config::Settings::config_dir()
                             .join("ui-settings.json");
                         std::fs::read_to_string(&path)
                             .ok()
@@ -689,7 +1253,7 @@ impl App {
                             .unwrap_or(false)
                     };
                 if voice_on {
-                    let recorder = cc_core::voice::global_voice_recorder();
+                    let recorder = claurst_core::voice::global_voice_recorder();
                     if let Ok(mut r) = recorder.lock() {
                         r.set_enabled(true);
                     }
@@ -710,21 +1274,405 @@ impl App {
             agent_type_badge: None,
             thinking_expanded: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
+            last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
+            last_input_area: Cell::new(ratatui::layout::Rect::default()),
+            focus: FocusTarget::Input,
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
+            message_row_map: RefCell::new(std::collections::HashMap::new()),
             total_message_lines: Cell::new(0),
+            last_render_scroll_offset: Cell::new(0),
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
+            last_click_time: None,
+            last_click_position: None,
+            click_count: 0,
+            context_menu_state: None,
             scroll_accel: 3.0,
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
+            update_available: None,
         }
     }
 
-    /// Update the active model name (also updates cost tracker).
-    pub fn set_model(&mut self, model: String) {
+    /// Load token budget from environment or model defaults.
+    /// Returns Some(max_tokens) if available, None otherwise.
+    /// Only enabled when the `token_budget` feature flag is active.
+    #[cfg(feature = "token_budget")]
+    fn load_token_budget() -> Option<u32> {
+        // First check CLAURST_TOKEN_BUDGET env var
+        if let Ok(budget_str) = std::env::var("CLAURST_TOKEN_BUDGET") {
+            if let Ok(budget) = budget_str.parse::<u32>() {
+                return Some(budget);
+            }
+        }
+        // Could extend this to check model defaults, but for now just env var
+        None
+    }
+
+    #[cfg(not(feature = "token_budget"))]
+    fn load_token_budget() -> Option<u32> {
+        None
+    }
+
+    fn current_user_turn_index(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .filter(|msg| msg.role == Role::User)
+            .count()
+            .checked_sub(1)
+    }
+
+    fn current_agent_mode_snapshot(&self) -> String {
+        self.agent_mode
+            .clone()
+            .unwrap_or_else(|| if self.plan_mode { "plan" } else { "build" }.to_string())
+    }
+
+    fn begin_user_turn_snapshot(&mut self) {
+        self.turn_metadata.push(TurnMetadata {
+            submitted_at: Some(format_turn_time_label()),
+            model_name: Some(self.model_name.clone()),
+            agent_mode: Some(self.current_agent_mode_snapshot()),
+            duration: None,
+            interrupted: false,
+        });
+    }
+
+    fn sync_turn_metadata_to_messages(&mut self) {
+        let user_count = self
+            .messages
+            .iter()
+            .filter(|msg| msg.role == Role::User)
+            .count();
+
+        if self.turn_metadata.len() > user_count {
+            self.turn_metadata.truncate(user_count);
+            return;
+        }
+
+        while self.turn_metadata.len() < user_count {
+            self.turn_metadata.push(TurnMetadata::default());
+        }
+    }
+
+    fn complete_current_turn_snapshot(&mut self, interrupted: bool) {
+        if let Some(index) = self.current_user_turn_index() {
+            if self.turn_metadata.len() <= index {
+                self.sync_turn_metadata_to_messages();
+            }
+
+            let model_name = self.model_name.clone();
+            let agent_mode = self.current_agent_mode_snapshot();
+            if let Some(meta) = self.turn_metadata.get_mut(index) {
+                meta.duration = self.last_turn_elapsed.clone();
+                meta.interrupted = interrupted;
+                if meta.model_name.is_none() {
+                    meta.model_name = Some(model_name);
+                }
+                if meta.agent_mode.is_none() {
+                    meta.agent_mode = Some(agent_mode);
+                }
+            }
+        }
+    }
+
+    fn flush_streamed_assistant_message(&mut self) {
+        if self.streaming_text.trim().is_empty() && self.streaming_thinking.trim().is_empty() {
+            self.streaming_text.clear();
+            self.streaming_thinking.clear();
+            return;
+        }
+
+        let thinking = std::mem::take(&mut self.streaming_thinking);
+        let text = std::mem::take(&mut self.streaming_text);
+
+        let mut blocks = Vec::new();
+        if !thinking.trim().is_empty() {
+            blocks.push(ContentBlock::Thinking {
+                thinking,
+                signature: String::new(),
+            });
+        }
+        if !text.is_empty() {
+            blocks.push(ContentBlock::Text { text });
+        }
+
+        let msg = match blocks.len() {
+            0 => return,
+            1 => match blocks.pop().unwrap() {
+                ContentBlock::Text { text } => Message::assistant(text),
+                block => Message::assistant_blocks(vec![block]),
+            },
+            _ => Message::assistant_blocks(blocks),
+        };
+
+        self.messages.push(msg);
+        self.invalidate_transcript();
+        self.on_new_message();
+    }
+
+    fn display_default_model_for_provider(&self, provider_id: &str) -> String {
+        if let Some(best) = self.model_registry.best_model_for_provider(provider_id) {
+            if provider_id == "anthropic" {
+                best
+            } else {
+                format!("{}/{}", provider_id, best)
+            }
+        } else {
+            crate::model_picker::default_model_for_provider(provider_id)
+        }
+    }
+
+    fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
+        let cache_path = dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("claurst")
+            .join("models.json");
+        if cache_path.exists() {
+            self.model_registry.load_cache(&cache_path);
+        }
+
+        let models = crate::model_picker::models_for_provider_from_registry(
+            provider_id,
+            &self.model_registry,
+        );
+        self.model_picker.set_models(models);
+        self.model_picker_fetch_pending = true;
+
+        let provider_prefix = format!("{}/", provider_id);
+        let current_model = if self.config.provider.as_deref() == Some(provider_id) {
+            self.model_name
+                .strip_prefix(&provider_prefix)
+                .unwrap_or(self.model_name.as_str())
+                .to_string()
+        } else {
+            let default_model = self.display_default_model_for_provider(provider_id);
+            default_model
+                .strip_prefix(&provider_prefix)
+                .unwrap_or(default_model.as_str())
+                .to_string()
+        };
+
+        self.model_picker.open_with_title(
+            title.unwrap_or_else(|| "Select model".to_string()),
+            &current_model,
+            self.effort_level,
+            self.fast_mode,
+        );
+    }
+
+    fn activate_provider(&mut self, provider_id: String, provider_name: String, status_prefix: &str) {
+        let picker_title = provider_name.clone();
+        self.fast_mode = false;
+        self.set_provider_default(provider_id.clone());
+        self.persist_provider_and_model();
+        self.has_credentials = true;
+        self.status_message = Some(format!("{} {}.", status_prefix, provider_name));
+        self.open_model_picker_for_provider(&provider_id, Some(picker_title));
+    }
+
+    fn persist_provider_and_model(&self) {
+        let mut settings = Settings::load_sync().unwrap_or_default();
+        settings.provider = self.config.provider.clone();
+        settings.config.provider = self.config.provider.clone();
+        settings.config.model = self.config.model.clone();
+        let _ = settings.save_sync();
+    }
+
+    fn infer_provider_from_model(model: &str) -> Option<String> {
+        if let Some((provider, _)) = model.split_once('/') {
+            let known = [
+                "anthropic",
+                "openai",
+                "google",
+                "groq",
+                "cerebras",
+                "deepseek",
+                "mistral",
+                "xai",
+                "openrouter",
+                "github-copilot",
+                "cohere",
+                "perplexity",
+                "togetherai",
+                "together-ai",
+                "deepinfra",
+                "venice",
+                "ollama",
+                "lmstudio",
+                "llamacpp",
+                "azure",
+                "amazon-bedrock",
+            ];
+            if known.contains(&provider) {
+                return Some(provider.to_string());
+            }
+        }
+
+        if model.starts_with("claude") {
+            Some("anthropic".to_string())
+        } else if model.starts_with("gpt-")
+            || model.starts_with("o1")
+            || model.starts_with("o3")
+            || model.starts_with("o4")
+        {
+            Some("openai".to_string())
+        } else if model.starts_with("gemini") || model.starts_with("gemma") {
+            Some("google".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Switch the active provider while clearing any explicit model override.
+    fn set_provider_default(&mut self, provider_id: String) {
+        self.config.provider = Some(provider_id.clone());
+        self.config.model = None;
+
+        let model = self.display_default_model_for_provider(&provider_id);
         self.cost_tracker.set_model(&model);
         self.model_name = model;
+        self.refresh_context_window_size();
+        self.context_used_tokens = 0;
+    }
+
+    /// Update the Rustle pose for this frame — handles temporary poses, random blinks,
+    /// and the loading spinner on stalls/errors.
+    /// Call once per frame before rendering.
+    pub fn tick_rustle_pose(&mut self) {
+        // Loading spinner: shown when streaming has stalled (no data for 3s+).
+        if self.is_streaming {
+            if let Some(start) = self.stall_start {
+                if start.elapsed() > std::time::Duration::from_secs(3) {
+                    self.rustle_current_pose = crate::rustle::RustlePose::Loading {
+                        frame: self.frame_count,
+                    };
+                    return;
+                }
+            }
+        }
+
+        // Check if a temporary pose is active.
+        if let Some(until) = self.rustle_pose_until {
+            if std::time::Instant::now() < until {
+                self.rustle_current_pose = self.rustle_temp_pose.clone()
+                    .unwrap_or(crate::rustle::RustlePose::Default);
+                return;
+            }
+            // Expired — clear it.
+            self.rustle_pose_until = None;
+            self.rustle_temp_pose = None;
+        }
+
+        // Random eye-shift: every ~200-500 frames, briefly look right.
+        if self.frame_count >= self.rustle_next_blink {
+            self.rustle_temp_pose = Some(crate::rustle::RustlePose::LookRight);
+            self.rustle_pose_until = Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(800)
+            );
+            // Schedule next blink 200-500 frames from now (random-ish).
+            let jitter = (self.frame_count.wrapping_mul(7) % 300) + 200;
+            self.rustle_next_blink = self.frame_count + jitter;
+            self.rustle_current_pose = crate::rustle::RustlePose::LookRight;
+            return;
+        }
+
+        self.rustle_current_pose = crate::rustle::RustlePose::Default;
+    }
+
+    /// Trigger Rustle looking down briefly (called on Tab / mode switch).
+    pub fn rustle_look_down(&mut self) {
+        self.rustle_temp_pose = Some(crate::rustle::RustlePose::LookDown);
+        self.rustle_pose_until = Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(1)
+        );
+    }
+
+    /// Cycle to the next agent mode: build → plan → explore → build.
+    /// Sets `agent_mode_changed` so the main loop can update the query config
+    /// and tool list accordingly.
+    pub fn cycle_agent_mode(&mut self) {
+        const MODES: &[&str] = &["build", "plan", "explore"];
+        let current = self.agent_mode.as_deref().unwrap_or("build");
+        let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
+        let next = MODES[(idx + 1) % MODES.len()];
+        self.agent_mode = Some(next.to_string());
+        self.agent_mode_changed = true;
+        self.accent_color = accent_for_mode(Some(next));
+
+        // Sync plan_mode flag for legacy code paths
+        self.plan_mode = next == "plan";
+
+        let label = match next {
+            "build" => "Build",
+            "plan" => "Plan",
+            "explore" => "Explore",
+            other => other,
+        };
+        self.status_message = Some(format!("Switched to {} mode.", label));
+    }
+
+    /// Activate a speech mode (caveman/rocky) with a level (lite/full/ultra).
+    /// Pass `mode = None` to deactivate.
+    pub fn set_speech_mode(&mut self, mode: Option<&str>, level: &str) {
+        match mode {
+            Some(m) => {
+                self.speech_mode = Some(m.to_string());
+                self.speech_level = level.to_string();
+                let prompt = speech_mode_prompt(m, level);
+                self.config.append_system_prompt = Some(prompt);
+
+                let confirm = match (m, level) {
+                    ("caveman", "lite") => "Caveman mode. Lite.",
+                    ("caveman", "ultra") => "CAVEMAN ULTRA. NO WORD. ONLY FIX.",
+                    ("caveman", _) => "Caveman mode. Full. Oog.",
+                    ("rocky", "lite") => "Rocky mode. Lite.",
+                    ("rocky", "ultra") => "Rocky ultra. Big science. Amaze amaze amaze.",
+                    ("rocky", _) => "Rocky mode. Full. Good good good.",
+                    _ => "Speech mode activated.",
+                };
+                self.status_message = Some(confirm.to_string());
+            }
+            None => {
+                self.speech_mode = None;
+                self.speech_level = "full".to_string();
+                self.config.append_system_prompt = None;
+                self.status_message = Some("Normal mode.".to_string());
+            }
+        }
+    }
+
+    /// Update the context window size from the model registry for the current model.
+    pub fn refresh_context_window_size(&mut self) {
+        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+        let model_id = self.model_name
+            .strip_prefix(&format!("{}/", provider))
+            .unwrap_or(&self.model_name);
+        if let Some(entry) = self.model_registry.get(provider, model_id) {
+            self.context_window_size = entry.info.context_window as u64;
+        } else {
+            // Fallback: common defaults
+            self.context_window_size = match provider {
+                "anthropic" => 200_000,
+                "openai" => 128_000,
+                "google" => 1_048_576,
+                _ => 128_000,
+            };
+        }
+    }
+
+    /// Update the active model name (also updates config + cost tracker).
+    pub fn set_model(&mut self, model: String) {
+        self.cost_tracker.set_model(&model);
+        self.model_name = model.clone();
+        self.config.model = Some(model.clone());
+        if let Some(provider) = Self::infer_provider_from_model(&model) {
+            self.config.provider = Some(provider);
+        }
+        self.refresh_context_window_size();
+        // Reset used tokens when switching models (context is fresh).
+        self.context_used_tokens = 0;
     }
 
     /// Apply a theme by name, persisting it to config.
@@ -733,6 +1681,7 @@ impl App {
             "dark" => Theme::Dark,
             "light" => Theme::Light,
             "default" => Theme::Default,
+            "deuteranopia" => Theme::Deuteranopia,
             other => Theme::Custom(other.to_string()),
         };
         self.config.theme = theme;
@@ -741,6 +1690,33 @@ impl App {
         settings.config.theme = self.config.theme.clone();
         let _ = settings.save_sync();
         self.status_message = Some(format!("Theme set to: {}", theme_name));
+    }
+
+    pub fn apply_provider_refresh(
+        &mut self,
+        config: Config,
+        provider_registry: Option<std::sync::Arc<claurst_api::ProviderRegistry>>,
+        auth_store: claurst_core::AuthStore,
+        has_credentials: bool,
+        status_message: String,
+    ) {
+        self.close_secondary_views();
+        self.config = config;
+        self.provider_registry = provider_registry;
+        self.model_registry = claurst_api::ModelRegistry::new();
+        self.auth_store = auth_store;
+        self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
+        self.model_picker = ModelPickerState::new();
+        self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
+        self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
+        self.device_auth_pending = None;
+        self.model_picker_fetch_pending = false;
+        self.has_credentials = has_credentials;
+        self.fast_mode = false;
+        self.model_name = self.config.effective_model().to_string();
+        self.cost_tracker.set_model(&self.model_name);
+        self.status_message = Some(status_message);
+        self.clear_prompt();
     }
 
     /// Handle slash commands that should open UI screens rather than execute
@@ -757,6 +1733,7 @@ impl App {
                     Theme::Dark => "dark",
                     Theme::Light => "light",
                     Theme::Default => "default",
+                    Theme::Deuteranopia => "deuteranopia",
                     Theme::Custom(s) => s.as_str(),
                 };
                 self.theme_screen.open(current);
@@ -807,32 +1784,27 @@ impl App {
                 self.hooks_config_menu.open();
                 true
             }
+            "connect" => {
+                self.connect_dialog.open();
+                true
+            }
             "model" => {
-                let current = self.model_name.clone();
-                let effort = self.effort_level;
-                let fast = self.fast_mode;
-                self.model_picker.open_with_state(&current, effort, fast);
-
-                // Kick off a background fetch of the model list if we don't
-                // already have a fresh list and aren't already loading.
-                if !self.model_picker.models_loaded && !self.model_picker.loading_models {
-                    if let Ok(client) = cc_api::AnthropicClient::from_config(&self.config) {
-                        let (tx, rx) = tokio::sync::mpsc::channel(1);
-                        self.model_fetch_rx = Some(rx);
-                        self.model_picker.loading_models = true;
-                        tokio::spawn(async move {
-                            let entries =
-                                crate::model_picker::ModelPickerState::fetch_models(&client)
-                                    .await;
-                            let _ = tx.send(entries).await;
-                        });
-                    }
+                if !self.has_credentials {
+                    self.connect_dialog.open();
+                    self.status_message = Some("Connect a provider to choose a model.".to_string());
+                    return true;
                 }
-
+                let provider = self
+                    .config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "anthropic".to_string());
+                self.open_model_picker_for_provider(&provider, None);
                 true
             }
             "session" | "resume" => {
                 self.session_browser.open(vec![]);
+                self.session_list_pending = true;
                 true
             }
             "clear" => {
@@ -840,7 +1812,9 @@ impl App {
                 self.system_annotations.clear();
                 self.display_messages.clear();
                 self.streaming_text.clear();
+                self.streaming_thinking.clear();
                 self.tool_use_blocks.clear();
+                self.turn_metadata.clear();
                 self.invalidate_transcript();
                 self.status_message = Some("Conversation cleared.".to_string());
                 true
@@ -863,7 +1837,7 @@ impl App {
                 true
             }
             "plan" => {
-                use cc_core::config::PermissionMode;
+                use claurst_core::config::PermissionMode;
                 self.plan_mode = !self.plan_mode;
                 self.config.permission_mode = if self.plan_mode {
                     PermissionMode::Plan
@@ -871,11 +1845,11 @@ impl App {
                     PermissionMode::Default
                 };
                 self.status_message = Some(if self.plan_mode {
-                    "Plan mode ON — Claude will plan before acting.".to_string()
+                    "Plan mode ON — Claurst will plan before acting.".to_string()
                 } else {
                     "Plan mode OFF.".to_string()
                 });
-                // Allow CLI path to also run (sends UserMessage to Claude).
+                // Allow CLI path to also run (sends UserMessage to Claurst).
                 false
             }
             "compact" => {
@@ -944,7 +1918,7 @@ impl App {
                     self.voice_mode_notice.dismiss();
                     self.status_message = Some("Voice mode disabled.".to_string());
                 } else {
-                    let recorder = cc_core::voice::global_voice_recorder();
+                    let recorder = claurst_core::voice::global_voice_recorder();
                     if let Ok(mut r) = recorder.lock() {
                         r.set_enabled(true);
                     }
@@ -976,6 +1950,7 @@ impl App {
             }
             "rename" => {
                 self.session_browser.open(vec![]);
+                self.session_list_pending = true;
                 self.session_browser.start_rename();
                 true
             }
@@ -1011,8 +1986,17 @@ impl App {
         self.hooks_config_menu.close();
         self.model_picker.close();
         self.session_browser.close();
+        self.session_branching.close();
+        self.tasks_overlay.close();
         self.export_dialog.dismiss();
         self.context_viz.close();
+        self.connect_dialog.close();
+        self.command_palette.close();
+        self.key_input_dialog.close();
+        self.device_auth_dialog.close();
+        self.settings_screen.close();
+        self.theme_screen.close();
+        self.privacy_screen.close();
     }
 
     /// Perform the export based on the selected format. Returns the path written.
@@ -1082,20 +2066,20 @@ impl App {
                         .collect();
 
                     let (status, error_message) = match manager.server_status(&server.name) {
-                        cc_mcp::McpServerStatus::Connected { .. } => {
+                        claurst_mcp::McpServerStatus::Connected { .. } => {
                             (McpViewStatus::Connected, None)
                         }
-                        cc_mcp::McpServerStatus::Connecting => {
+                        claurst_mcp::McpServerStatus::Connecting => {
                             (McpViewStatus::Connecting, None)
                         }
-                        cc_mcp::McpServerStatus::Disconnected { last_error } => {
+                        claurst_mcp::McpServerStatus::Disconnected { last_error } => {
                             if last_error.is_some() {
                                 (McpViewStatus::Error, last_error)
                             } else {
                                 (McpViewStatus::Disconnected, None)
                             }
                         }
-                        cc_mcp::McpServerStatus::Failed { error, .. } => {
+                        claurst_mcp::McpServerStatus::Failed { error, .. } => {
                             (McpViewStatus::Error, Some(error))
                         }
                     };
@@ -1206,6 +2190,9 @@ impl App {
             Role::User => Message::user(text),
             Role::Assistant => Message::assistant(text),
         };
+        if role == Role::User {
+            self.begin_user_turn_snapshot();
+        }
         self.messages.push(msg);
         self.invalidate_transcript();
         self.on_new_message();
@@ -1213,11 +2200,16 @@ impl App {
 
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        self.sync_turn_metadata_to_messages();
         self.invalidate_transcript();
     }
 
     pub fn push_message(&mut self, message: Message) {
+        if message.role == Role::User {
+            self.begin_user_turn_snapshot();
+        }
         self.messages.push(message);
+        self.sync_turn_metadata_to_messages();
         self.invalidate_transcript();
         self.on_new_message();
     }
@@ -1254,7 +2246,7 @@ impl App {
     /// appropriate.  Call this after updating `token_count`.
     pub fn check_token_warnings(&mut self) {
         let window =
-            cc_query::context_window_for_model(&self.model_name) as u32;
+            claurst_query::context_window_for_model(&self.model_name) as u32;
         if window == 0 {
             return;
         }
@@ -1378,6 +2370,55 @@ impl App {
         self.refresh_prompt_input();
     }
 
+    // -----------------------------------------------------------------------
+    // Voice PTT helpers
+    // -----------------------------------------------------------------------
+
+    /// Start PTT recording: open the microphone capture stream and signal the
+    /// UI.  No-op when no voice recorder is attached or recording is already
+    /// in progress.
+    pub fn handle_voice_ptt_start(&mut self) {
+        if self.voice_recording || self.voice_recorder.is_none() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        self.voice_event_rx = Some(rx);
+        self.voice_recording = true;
+        if let Some(ref recorder_arc) = self.voice_recorder {
+            let recorder = recorder_arc.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut r) = recorder.lock() {
+                    tokio::runtime::Handle::current()
+                        .block_on(r.start_recording(tx))
+                        .ok();
+                }
+            });
+        }
+        self.status_message = Some("Recording\u{2026} release V or press Enter to transcribe".to_string());
+    }
+
+    /// Stop PTT recording: flip the AtomicBool inside VoiceRecorder so the
+    /// capture thread exits, then fire a "Transcribing…" notice.  The
+    /// transcript text arrives later via `voice_event_rx` and is injected into
+    /// the prompt by the event-loop drain.
+    pub fn handle_voice_ptt_stop(&mut self) {
+        if !self.voice_recording {
+            return;
+        }
+        self.voice_recording = false;
+        if let Some(ref recorder_arc) = self.voice_recorder {
+            let recorder = recorder_arc.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut r) = recorder.lock() {
+                    tokio::runtime::Handle::current()
+                        .block_on(r.stop_recording())
+                        .ok();
+                }
+            });
+        }
+        self.status_message = Some("Transcribing\u{2026}".to_string());
+    }
+
     pub fn attach_turn_diff_state(
         &mut self,
         file_history: Arc<parking_lot::Mutex<FileHistory>>,
@@ -1388,7 +2429,7 @@ impl App {
         self.refresh_turn_diff_from_history();
     }
 
-    pub fn attach_mcp_manager(&mut self, mcp_manager: Arc<cc_mcp::McpManager>) {
+    pub fn attach_mcp_manager(&mut self, mcp_manager: Arc<claurst_mcp::McpManager>) {
         self.mcp_manager = Some(mcp_manager);
     }
 
@@ -1484,9 +2525,15 @@ impl App {
     /// Persist `has_completed_onboarding = true` to the settings file.
     /// Best-effort: failures are silently ignored to not disrupt the session.
     fn persist_onboarding_complete() -> anyhow::Result<()> {
-        let mut settings = cc_core::config::Settings::load_sync()?;
+        let mut settings = claurst_core::config::Settings::load_sync()?;
         settings.has_completed_onboarding = true;
         settings.save_sync()
+    }
+
+    /// Public wrapper so the main loop can mark onboarding complete without
+    /// going through the dialog flow.
+    pub fn persist_onboarding_complete_pub() -> anyhow::Result<()> {
+        Self::persist_onboarding_complete()
     }
 
     /// Process a keyboard event. Returns `true` when the input should be
@@ -1495,27 +2542,24 @@ impl App {
         if self.global_search.open {
             return self.handle_global_search_key(key);
         }
-        let key_context = self.current_key_context();
-        if let Some(keystroke) = key_event_to_keystroke(&key) {
-            let had_pending_chord = self.keybindings.has_pending_chord();
-            match self.keybindings.process(keystroke, &key_context) {
-                KeybindingResult::Action(action) => {
-                    return self.handle_keybinding_action(&action);
-                }
-                KeybindingResult::Unbound | KeybindingResult::Pending => return false,
-                KeybindingResult::NoMatch if had_pending_chord => return false,
-                KeybindingResult::NoMatch => {}
-            }
-        } else {
-            self.keybindings.cancel_chord();
-        }
 
-        // Clear any active text selection on key press (except Ctrl+C which copies it).
-        let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-        if !is_copy && self.selection_anchor.is_some() {
-            self.selection_anchor = None;
-            self.selection_focus = None;
-            *self.selection_text.borrow_mut() = String::new();
+        // ---- Context menu handling (highest priority for menu navigation) ----
+        if self.context_menu_state.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.dismiss_context_menu();
+                    return false;
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    self.navigate_context_menu(key.code);
+                    return false;
+                }
+                KeyCode::Enter => {
+                    self.execute_context_menu_item();
+                    return false;
+                }
+                _ => {}
+            }
         }
 
         // Bypass-permissions dialog: highest-priority gate — user must accept or the
@@ -1565,6 +2609,160 @@ impl App {
             return false;
         }
 
+        // Device code / browser auth dialog (GitHub Copilot, Anthropic OAuth)
+        if self.device_auth_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.device_auth_dialog.close();
+                    self.device_auth_pending = None;
+                }
+                _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Success(_)) => {
+                    // Any key after success -> store credential and close
+                    if let crate::device_auth_dialog::DeviceAuthStatus::Success(ref token) = self.device_auth_dialog.status {
+                        let provider_id = self.device_auth_dialog.provider_id.clone();
+                        let provider_name = self.device_auth_dialog.provider_name.clone();
+                        let token = token.clone();
+                        let credential = if provider_id == "github-copilot" {
+                            claurst_core::StoredCredential::OAuthToken {
+                                access: token.clone(),
+                                refresh: token,
+                                expires: 0,
+                            }
+                        } else {
+                            claurst_core::StoredCredential::ApiKey { key: token }
+                        };
+                        self.auth_store.set(
+                            &provider_id,
+                            credential,
+                        );
+                        self.device_auth_pending = None;
+                        self.device_auth_dialog.close();
+                        self.activate_provider(provider_id, provider_name, "Connected to");
+                        return false;
+                    }
+                }
+                _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Error(_)) => {
+                    // Any key after error -> close
+                    self.device_auth_dialog.close();
+                    self.device_auth_pending = None;
+                }
+                _ => {} // Ignore other keys while waiting
+            }
+            return false;
+        }
+
+        // API key input dialog (opened from /connect for key-based providers)
+        if self.key_input_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.key_input_dialog.close();
+                }
+                KeyCode::Enter => {
+                    let provider_id = self.key_input_dialog.provider_id.clone();
+                    let provider_name = self.key_input_dialog.provider_name.clone();
+                    let api_key = self.key_input_dialog.take_key();
+                    if !api_key.is_empty() {
+                        self.auth_store.set(
+                            &provider_id,
+                            claurst_core::StoredCredential::ApiKey { key: api_key },
+                        );
+                        self.activate_provider(provider_id, provider_name, "Connected to");
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.key_input_dialog.backspace();
+                }
+                KeyCode::Char(c) => {
+                    self.key_input_dialog.insert_char(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Connect-a-provider dialog (/connect command)
+        if self.connect_dialog.visible {
+            match key.code {
+                KeyCode::Esc => { self.connect_dialog.close(); }
+                KeyCode::Home => { self.connect_dialog.move_home(); }
+                KeyCode::End => { self.connect_dialog.move_end(); }
+                KeyCode::Up => { self.connect_dialog.move_up(); }
+                KeyCode::Down => { self.connect_dialog.move_down(); }
+                KeyCode::PageUp => { self.connect_dialog.page_up(); }
+                KeyCode::PageDown => { self.connect_dialog.page_down(); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.connect_dialog.move_up(); }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.connect_dialog.move_down(); }
+                KeyCode::Enter => {
+                    if let Some(selected) = self.connect_dialog.selected().cloned() {
+                        self.connect_dialog.close();
+
+                        match selected.id.as_str() {
+                            // Local providers — activate immediately, no key needed
+                            "ollama" | "lmstudio" | "llamacpp" => {
+                                self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
+                            }
+                            "anthropic" => {
+                                // Anthropic: use API key from console.anthropic.com
+                                // (OAuth requires a registered app which Claurst doesn't have)
+                                self.key_input_dialog.open(selected.id.clone(), selected.title.clone());
+                            }
+                            "github-copilot" => {
+                                // GitHub Copilot: device code flow
+                                self.device_auth_dialog.open(selected.id.clone(), selected.title.clone());
+                                self.device_auth_pending = Some("github-copilot".to_string());
+                            }
+                            "openai-codex" => {
+                                // OpenAI Codex: browser OAuth flow (spawned by main loop)
+                                self.device_auth_dialog.open("openai-codex".into(), "OpenAI Codex".into());
+                                self.device_auth_pending = Some("openai-codex".to_string());
+                            }
+                            // AWS Bedrock — accept a bearer token via key input dialog
+                            "amazon-bedrock" => {
+                                self.key_input_dialog
+                                    .open(selected.id.clone(), selected.title.clone());
+                            }
+                            // All other providers — open API key input dialog
+                            _ => {
+                                self.key_input_dialog
+                                    .open(selected.id.clone(), selected.title.clone());
+                            }
+                        }
+                    }
+                }
+                KeyCode::Backspace => { self.connect_dialog.filter_pop(); }
+                KeyCode::Char(c) => { self.connect_dialog.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Command palette (Ctrl+K)
+        if self.command_palette.visible {
+            match key.code {
+                KeyCode::Esc => { self.command_palette.close(); }
+                KeyCode::Home => { self.command_palette.move_home(); }
+                KeyCode::End => { self.command_palette.move_end(); }
+                KeyCode::Up => { self.command_palette.move_up(); }
+                KeyCode::Down => { self.command_palette.move_down(); }
+                KeyCode::PageUp => { self.command_palette.page_up(); }
+                KeyCode::PageDown => { self.command_palette.page_down(); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.command_palette.move_up(); }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.command_palette.move_down(); }
+                KeyCode::Enter => {
+                    if let Some(selected) = self.command_palette.selected().cloned() {
+                        self.command_palette.close();
+                        // Put the command in the input and signal for execution
+                        self.prompt_input.replace_text(selected.id.clone());
+                        return true; // signal to submit this as input
+                    }
+                }
+                KeyCode::Backspace => { self.command_palette.filter_pop(); }
+                KeyCode::Char(c) => { self.command_palette.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
         // Invalid-config dialog intercepts Enter/Esc to dismiss
         if self.invalid_config_dialog.visible {
             match key.code {
@@ -1580,28 +2778,90 @@ impl App {
         if self.model_picker.visible {
             match key.code {
                 KeyCode::Esc => self.model_picker.close(),
+                KeyCode::Home => self.model_picker.select_first(),
+                KeyCode::End => self.model_picker.select_last(),
                 KeyCode::Up => self.model_picker.select_prev(),
                 KeyCode::Down => self.model_picker.select_next(),
                 KeyCode::Left => self.model_picker.effort_prev(),
                 KeyCode::Right => self.model_picker.effort_next(),
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_prev(),
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_next(),
                 KeyCode::Enter => {
                     if let Some((model_id, effort)) = self.model_picker.confirm() {
                         // If user picked a model other than the fast-mode model
                         // while fast mode was active, turn fast mode off.
-                        if self.fast_mode && model_id != FAST_MODE_MODEL {
+                        if self.fast_mode && !is_fast_mode_model(&model_id) {
                             self.fast_mode = false;
                         }
                         if let Some(e) = effort {
                             self.effort_level = e;
                         }
-                        self.set_model(model_id.clone());
+                        // Store explicit selections in the canonical
+                        // "provider/model" form for non-Anthropic providers.
+                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        let full_model = if provider == "anthropic" {
+                            model_id.clone()
+                        } else {
+                            format!("{}/{}", provider, model_id)
+                        };
+                        self.set_model(full_model.clone());
+                        self.persist_provider_and_model();
                         let effort_hint = effort.map(|e| format!(" [{}]", e.label())).unwrap_or_default();
-                        self.status_message = Some(format!("Model: {}{}", model_id, effort_hint));
+                        self.status_message = Some(format!("Model: {}{}", full_model, effort_hint));
                     }
                 }
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),
                 KeyCode::Char(c) => self.model_picker.push_filter_char(c),
                 _ => {}
+            }
+            return false;
+        }
+
+        // Session branching overlay intercepts navigation and Esc
+        if self.session_branching.visible {
+            use crate::session_branching::BranchBrowserMode;
+            match self.session_branching.mode {
+                BranchBrowserMode::Browse => {
+                    match key.code {
+                        KeyCode::Esc => self.session_branching.cancel(),
+                        KeyCode::Up => self.session_branching.select_prev(),
+                        KeyCode::Down => self.session_branching.select_next(),
+                        KeyCode::Char('n') => self.session_branching.start_create_new(),
+                        KeyCode::Char('d') => self.session_branching.start_delete_confirm(),
+                        KeyCode::Enter => {
+                            if let Some(branch) = self.session_branching.selected_branch() {
+                                self.status_message = Some(format!("Switched to branch: {}", branch.name));
+                                self.session_branching.close();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                BranchBrowserMode::CreateNew => {
+                    match key.code {
+                        KeyCode::Esc => self.session_branching.cancel(),
+                        KeyCode::Enter => {
+                            if let Some((name, at_msg)) = self.session_branching.confirm_create_new() {
+                                self.status_message = Some(format!("Created branch: {} at message {}", name, at_msg));
+                                self.session_branching.close();
+                            }
+                        }
+                        KeyCode::Backspace => self.session_branching.pop_create_char(),
+                        KeyCode::Char(c) => self.session_branching.push_create_char(c),
+                        _ => {}
+                    }
+                }
+                BranchBrowserMode::ConfirmDelete => {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n') => self.session_branching.cancel(),
+                        KeyCode::Enter | KeyCode::Char('y') => {
+                            if let Some(branch_id) = self.session_branching.confirm_delete() {
+                                self.status_message = Some(format!("Deleted branch: {}", branch_id));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             return false;
         }
@@ -1642,6 +2902,22 @@ impl App {
                         _ => {}
                     }
                 }
+            }
+            return false;
+        }
+
+        // Tasks overlay intercepts navigation and Esc
+        if self.tasks_overlay.visible {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.tasks_overlay.close(),
+                KeyCode::Up => self.tasks_overlay.select_prev(),
+                KeyCode::Down => self.tasks_overlay.select_next(),
+                KeyCode::Enter => {
+                    if let Some((task_id, new_status)) = self.tasks_overlay.cycle_and_persist_status() {
+                        self.status_message = Some(format!("Task {} → {}", task_id, new_status));
+                    }
+                }
+                _ => {}
             }
             return false;
         }
@@ -1921,6 +3197,30 @@ impl App {
             }
         }
 
+        // ---- Keybinding processor (runs AFTER all dialog checks) ----------
+        let key_context = self.current_key_context();
+        if let Some(keystroke) = key_event_to_keystroke(&key) {
+            let had_pending_chord = self.keybindings.has_pending_chord();
+            match self.keybindings.process(keystroke, &key_context) {
+                KeybindingResult::Action(action) => {
+                    return self.handle_keybinding_action(&action);
+                }
+                KeybindingResult::Unbound | KeybindingResult::Pending => return false,
+                KeybindingResult::NoMatch if had_pending_chord => return false,
+                KeybindingResult::NoMatch => {}
+            }
+        } else {
+            self.keybindings.cancel_chord();
+        }
+
+        // Clear any active text selection on key press (except Ctrl+C which copies it).
+        let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if !is_copy && self.selection_anchor.is_some() {
+            self.selection_anchor = None;
+            self.selection_focus = None;
+            *self.selection_text.borrow_mut() = String::new();
+        }
+
         // ---- Voice hold-to-talk (Alt+V toggles recording on/off) ----------
         if key.code == KeyCode::Char('v')
             && key.modifiers.contains(KeyModifiers::ALT)
@@ -1974,6 +3274,23 @@ impl App {
             return false;
         }
 
+        // ---- Voice PTT: plain V press starts recording when voice is on ----
+        // This is the "hold to talk" variant.  The user presses V to begin
+        // recording; releasing V (handled in the run loop) or pressing Enter
+        // stops the capture and triggers transcription.
+        // Only active when voice mode is enabled (voice_recorder is Some) and
+        // the prompt input is in default (non-vim) mode so 'v' doesn't conflict
+        // with vim keybindings.
+        if key.code == KeyCode::Char('v')
+            && key.modifiers == KeyModifiers::NONE
+            && self.voice_recorder.is_some()
+            && !self.voice_recording
+            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
+        {
+            self.handle_voice_ptt_start();
+            return false;
+        }
+
         // ---- Ctrl+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).
@@ -2003,7 +3320,50 @@ impl App {
             return false;
         }
 
+        // ---- Enter while PTT recording: stop capture instead of submitting ----
+        if key.code == KeyCode::Enter
+            && self.voice_recording
+            && self.voice_recorder.is_some()
+        {
+            self.handle_voice_ptt_stop();
+            return false;
+        }
+
+        // ---- Focus state machine: transcript mode --------------------------
+        // When the transcript pane has focus, intercept Escape and scroll keys.
+        // Printable characters switch focus back to Input and fall through so the
+        // keystroke is processed normally by the prompt editor below.
+        if self.focus == FocusTarget::Transcript {
+            match key.code {
+                KeyCode::Esc => {
+                    self.focus = FocusTarget::Input;
+                    return false;
+                }
+                KeyCode::PageUp | KeyCode::PageDown => {
+                    // Let these fall through to the normal scroll handling below.
+                }
+                KeyCode::Char(_) if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    // Printable char: switch focus to Input and process normally.
+                    self.focus = FocusTarget::Input;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
+            // ---- ESC: cancel streaming (status bar advertises "esc interrupt") ----
+            KeyCode::Esc if self.is_streaming => {
+                self.is_streaming = false;
+                self.spinner_verb = None;
+                self.streaming_text.clear();
+                self.streaming_thinking.clear();
+                self.tool_use_blocks.clear();
+                self.status_message = Some("Cancelled.".to_string());
+                self.complete_current_turn_snapshot(true);
+            }
+
             // ---- Quit / cancel ----------------------------------------
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // If text is selected, copy it to clipboard instead of quitting.
@@ -2020,6 +3380,7 @@ impl App {
                     self.is_streaming = false;
                     self.spinner_verb = None;
                     self.streaming_text.clear();
+                    self.streaming_thinking.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                 } else {
@@ -2047,14 +3408,64 @@ impl App {
                 self.refresh_global_search();
             }
 
+            // ---- Tasks overlay (Ctrl+T) --------------------------------
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.tasks_overlay.toggle();
+            }
+
             // ---- Help overlay ------------------------------------------
             KeyCode::F(1) => {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
             }
-            KeyCode::Char('?') if key.modifiers.is_empty() && !self.is_streaming => {
+            KeyCode::Char('?')
+                if !self.is_streaming
+                    && self.prompt_input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
+            }
+
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.kill_line_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.kill_word_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+                self.prompt_input.yank();
+                self.refresh_prompt_input();
+            }
+
+            // ---- Alt/Meta key text editing operations -------------------
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.yank_pop();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.delete_word_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.delete_word_forward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.move_word_backward();
+                self.sync_legacy_prompt_fields();
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.move_word_forward();
+                self.sync_legacy_prompt_fields();
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+                self.prompt_input.delete_word_at_cursor();
+                self.refresh_prompt_input();
             }
 
             // ---- Text entry (blocked while streaming) ------------------
@@ -2092,11 +3503,16 @@ impl App {
             }
             KeyCode::Tab if !self.is_streaming => {
                 if !self.prompt_input.suggestions.is_empty() {
+                    // Accept slash-command suggestion
                     if self.prompt_input.suggestion_index.is_none() {
                         self.prompt_input.suggestion_index = Some(0);
                     }
                     self.prompt_input.accept_suggestion();
                     self.refresh_prompt_input();
+                } else if self.prompt_input.is_empty() {
+                    // Cycle agent mode: build → plan → explore → build
+                    self.cycle_agent_mode();
+                    self.rustle_look_down();
                 }
             }
 
@@ -2104,7 +3520,7 @@ impl App {
             // Default → AcceptEdits → BypassPermissions → Default
             // Mirrors TS bottom-left indicator cycling behaviour.
             KeyCode::BackTab if !self.is_streaming => {
-                use cc_core::config::PermissionMode;
+                use claurst_core::config::PermissionMode;
                 self.config.permission_mode = match self.config.permission_mode {
                     PermissionMode::Default => PermissionMode::AcceptEdits,
                     PermissionMode::AcceptEdits => PermissionMode::BypassPermissions,
@@ -2136,6 +3552,22 @@ impl App {
                 self.new_messages_while_scrolled = 0;
                 self.scroll_offset = 0;
                 return true;
+            }
+
+            // ---- Message boundary navigation (Alt+Up/Alt+Down) ----------
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                // Jump up by ~20 lines (approximate message boundary).
+                self.scroll_offset = self.scroll_offset.saturating_add(20);
+                self.auto_scroll = false;
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                // Jump down by ~20 lines (approximate message boundary).
+                let new_off = self.scroll_offset.saturating_sub(20);
+                self.scroll_offset = new_off;
+                if new_off == 0 {
+                    self.auto_scroll = true;
+                    self.new_messages_while_scrolled = 0;
+                }
             }
 
             // ---- Input history navigation ------------------------------
@@ -2175,7 +3607,7 @@ impl App {
             // ---- Toggle last thinking block (t key) -------------------
             KeyCode::Char('t') if !self.is_streaming => {
                 // Find the last thinking block in the message list and toggle it
-                use cc_core::types::ContentBlock;
+                use claurst_core::types::ContentBlock;
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::{Hash, Hasher};
                 'outer: for msg in self.messages.iter().rev() {
@@ -2338,7 +3770,11 @@ impl App {
                 self.help_overlay.close();
                 self.show_help = false;
             }
-            KeyCode::Char('?') if key.modifiers.is_empty() => {
+            KeyCode::Char('?')
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
                 self.help_overlay.close();
                 self.show_help = false;
             }
@@ -2379,17 +3815,22 @@ impl App {
             KeyCode::Up => {
                 self.history_search_overlay.select_prev();
                 if let Some(hs) = self.history_search.as_mut() {
-                    if hs.selected > 0 {
-                        hs.selected -= 1;
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        if hs.selected == 0 {
+                            hs.selected = count - 1;
+                        } else {
+                            hs.selected -= 1;
+                        }
                     }
                 }
             }
             KeyCode::Down => {
                 self.history_search_overlay.select_next();
                 if let Some(hs) = self.history_search.as_mut() {
-                    let max = hs.matches.len().saturating_sub(1);
-                    if hs.selected < max {
-                        hs.selected += 1;
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        hs.selected = (hs.selected + 1) % count;
                     }
                 }
             }
@@ -2497,6 +3938,7 @@ impl App {
                     self.is_streaming = false;
                     self.spinner_verb = None;
                     self.streaming_text.clear();
+                    self.streaming_thinking.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                 } else {
@@ -2547,6 +3989,34 @@ impl App {
                     self.refresh_prompt_input();
                 } else if self.prompt_input.history_pos.is_some() {
                     self.prompt_input.history_down();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "goLineStart" => {
+                if !self.is_streaming {
+                    self.prompt_input.cursor = 0;
+                    self.sync_legacy_prompt_fields();
+                }
+                false
+            }
+            "goLineEnd" => {
+                if !self.is_streaming {
+                    self.prompt_input.cursor = self.prompt_input.text.len();
+                    self.sync_legacy_prompt_fields();
+                }
+                false
+            }
+            "killToStart" => {
+                if !self.is_streaming {
+                    self.prompt_input.kill_line_backward();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "killWord" => {
+                if !self.is_streaming {
+                    self.prompt_input.kill_word_backward();
                     self.refresh_prompt_input();
                 }
                 false
@@ -2612,8 +4082,13 @@ impl App {
             }
             "prevResult" => {
                 if let Some(hs) = self.history_search.as_mut() {
-                    if hs.selected > 0 {
-                        hs.selected -= 1;
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        if hs.selected == 0 {
+                            hs.selected = count - 1;
+                        } else {
+                            hs.selected -= 1;
+                        }
                     }
                 }
                 self.history_search_overlay.select_prev();
@@ -2621,12 +4096,128 @@ impl App {
             }
             "nextResult" => {
                 if let Some(hs) = self.history_search.as_mut() {
-                    let max = hs.matches.len().saturating_sub(1);
-                    if hs.selected < max {
-                        hs.selected += 1;
+                    let count = hs.matches.len();
+                    if count > 0 {
+                        hs.selected = (hs.selected + 1) % count;
                     }
                 }
                 self.history_search_overlay.select_next();
+                false
+            }
+            // ========== NEW KEYBINDING ACTIONS (Phase 1) ==========
+            "clearLine" => {
+                // Ctrl+L: Clear the current input line (like bash Ctrl+L)
+                if !self.is_streaming {
+                    self.prompt_input.text.clear();
+                    self.prompt_input.cursor = 0;
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "deleteCharBefore" => {
+                // Ctrl+H: Delete character before cursor (backspace equivalent)
+                if !self.is_streaming {
+                    self.prompt_input.backspace();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "previousMessage" => {
+                // Alt+←: Navigate to previous message in transcript
+                self.scroll_offset = self.scroll_offset.saturating_add(5);
+                self.auto_scroll = false;
+                false
+            }
+            "nextMessage" => {
+                // Alt+→: Navigate to next message in transcript
+                let new_off = self.scroll_offset.saturating_sub(5);
+                self.scroll_offset = new_off;
+                if new_off == 0 {
+                    self.auto_scroll = true;
+                }
+                false
+            }
+            "jumpToNextError" => {
+                // Ctrl+.: Jump to next error/issue in messages
+                self.jump_to_next_error();
+                false
+            }
+            "jumpToPreviousError" => {
+                // Ctrl+Shift+.: Jump to previous error/issue in messages
+                self.jump_to_previous_error();
+                false
+            }
+            "reverseIndent" => {
+                // Shift+Tab: Reverse indent (cycle permission mode)
+                use claurst_core::config::PermissionMode;
+                self.config.permission_mode = match self.config.permission_mode {
+                    PermissionMode::Default => PermissionMode::AcceptEdits,
+                    PermissionMode::AcceptEdits => PermissionMode::BypassPermissions,
+                    PermissionMode::BypassPermissions => PermissionMode::Default,
+                    PermissionMode::Plan => PermissionMode::Default,
+                };
+                let label = match self.config.permission_mode {
+                    PermissionMode::Default => "Default permissions",
+                    PermissionMode::AcceptEdits => "Accept-edits mode",
+                    PermissionMode::BypassPermissions => "Bypass permissions (dangerous)",
+                    PermissionMode::Plan => "Plan mode",
+                };
+                self.status_message = Some(label.to_string());
+                false
+            }
+            "openHelp" => {
+                // Alt+H: Open help (alternative to F1)
+                self.show_help = !self.show_help;
+                self.help_overlay.toggle();
+                false
+            }
+            "openModelPicker" => {
+                if !self.is_streaming {
+                    self.intercept_slash_command("model");
+                }
+                false
+            }
+            "openCommandPalette" => {
+                if !self.is_streaming {
+                    self.command_palette.open();
+                }
+                false
+            }
+            "deleteWord" => {
+                // Alt+D: Delete word forward
+                if !self.is_streaming {
+                    self.prompt_input.delete_word_at_cursor();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "sendMessage" => {
+                // Ctrl+M: Send message (alternative to Enter)
+                !self.is_streaming
+            }
+            "newline" => {
+                // Shift+Enter: insert a literal newline into the prompt.
+                if !self.is_streaming {
+                    self.prompt_input.insert_newline();
+                    self.refresh_prompt_input();
+                }
+                false
+            }
+            "indent" => {
+                // Tab: cycle agent mode when prompt is empty, accept
+                // slash-command suggestion otherwise.
+                if !self.is_streaming {
+                    if !self.prompt_input.suggestions.is_empty() {
+                        if self.prompt_input.suggestion_index.is_none() {
+                            self.prompt_input.suggestion_index = Some(0);
+                        }
+                        self.prompt_input.accept_suggestion();
+                        self.refresh_prompt_input();
+                    } else if self.prompt_input.is_empty() {
+                        self.cycle_agent_mode();
+                    self.rustle_look_down();
+                    }
+                }
                 false
             }
             _ => false,
@@ -2652,14 +4243,19 @@ impl App {
                 self.history_search_overlay.close();
             }
             KeyCode::Up => {
-                if hs.selected > 0 {
-                    hs.selected -= 1;
+                let count = hs.matches.len();
+                if count > 0 {
+                    if hs.selected == 0 {
+                        hs.selected = count - 1;
+                    } else {
+                        hs.selected -= 1;
+                    }
                 }
             }
             KeyCode::Down => {
-                let max = hs.matches.len().saturating_sub(1);
-                if hs.selected < max {
-                    hs.selected += 1;
+                let count = hs.matches.len();
+                if count > 0 {
+                    hs.selected = (hs.selected + 1) % count;
                 }
             }
             KeyCode::Backspace => {
@@ -2771,6 +4367,441 @@ impl App {
         !first_word.is_empty() && self.bash_prefix_allowlist.contains(first_word)
     }
 
+    // ---- Advanced mouse interaction helpers --------------------------------
+
+    /// Detect if a click is a double-click based on timing and position.
+    /// Returns true if the click is within ~500ms and ~5px of the last click.
+    fn is_double_click(&self, current_pos: (u16, u16)) -> bool {
+        let now = std::time::Instant::now();
+        match (self.last_click_time, self.last_click_position) {
+            (Some(last_time), Some(last_pos)) => {
+                let elapsed = now.duration_since(last_time);
+                let distance = ((current_pos.0 as i32 - last_pos.0 as i32).abs()
+                    + (current_pos.1 as i32 - last_pos.1 as i32).abs()) as u16;
+                elapsed.as_millis() < 500 && distance <= 5
+            }
+            _ => false,
+        }
+    }
+
+    /// Find word boundaries for the character at (col, row) in the selection text.
+    /// Returns (start_col, end_col) for the word containing the given position.
+    fn find_word_boundaries(&self, col: u16, _row: u16) -> Option<(u16, u16)> {
+        // Get the current selection text to determine word boundaries
+        let text = self.selection_text.borrow();
+        if text.is_empty() {
+            return None;
+        }
+
+        // For simplicity, we'll find the word based on whitespace and punctuation
+        // In a full implementation, we'd map visual positions back to text offsets
+        // For now, return a reasonable range around the click position
+        let start = col.saturating_sub(10).max(0);
+        let end = col.saturating_add(10);
+        Some((start, end))
+    }
+
+    /// Find line boundaries for the row containing the click.
+    /// Returns (start_row, end_row) for the line.
+    #[allow(dead_code)]
+    fn find_line_boundaries(&self, row: u16) -> Option<(u16, u16)> {
+        let selectable_area = self.last_selectable_area.get();
+        let line_start = selectable_area.y;
+        let line_end = selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1);
+
+        if row >= line_start && row <= line_end {
+            Some((row, row))
+        } else {
+            None
+        }
+    }
+
+    fn context_menu_items(kind: ContextMenuKind) -> &'static [ContextMenuItem] {
+        match kind {
+            ContextMenuKind::Message { .. } => &[ContextMenuItem::Copy, ContextMenuItem::Fork],
+            ContextMenuKind::Selection => &[ContextMenuItem::Copy],
+        }
+    }
+
+    fn message_index_at_row(&self, row: u16) -> Option<usize> {
+        self.message_row_map.borrow().get(&row).copied()
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_focus = None;
+        *self.selection_text.borrow_mut() = String::new();
+    }
+
+    /// Show context menu at the given position.
+    fn show_context_menu(&mut self, x: u16, y: u16, kind: ContextMenuKind) {
+        self.context_menu_state = Some(ContextMenuState {
+            x,
+            y,
+            selected_index: 0,
+            kind,
+        });
+    }
+
+    /// Dismiss the context menu.
+    fn dismiss_context_menu(&mut self) {
+        self.context_menu_state = None;
+    }
+
+    /// Handle context menu navigation with arrow keys.
+    fn navigate_context_menu(&mut self, direction: KeyCode) {
+        if let Some(mut menu) = self.context_menu_state {
+            let item_count = Self::context_menu_items(menu.kind).len();
+            if item_count == 0 {
+                self.context_menu_state = Some(menu);
+                return;
+            }
+            match direction {
+                KeyCode::Up => {
+                    if menu.selected_index == 0 {
+                        menu.selected_index = item_count - 1;
+                    } else {
+                        menu.selected_index -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    menu.selected_index = (menu.selected_index + 1) % item_count;
+                }
+                _ => return,
+            }
+            self.context_menu_state = Some(menu);
+        }
+    }
+
+    /// Execute the currently selected context menu item.
+    fn execute_context_menu_item(&mut self) {
+        if let Some(menu) = self.context_menu_state {
+            let items = Self::context_menu_items(menu.kind);
+
+            if menu.selected_index < items.len() {
+                let item = items[menu.selected_index];
+                self.handle_context_menu_action(item, menu.kind);
+            }
+        }
+        self.dismiss_context_menu();
+    }
+
+    /// Handle a context menu action.
+    fn handle_context_menu_action(&mut self, item: ContextMenuItem, kind: ContextMenuKind) {
+        match item {
+            ContextMenuItem::Copy => {
+                let text = match kind {
+                    ContextMenuKind::Message { message_index } => self
+                        .messages
+                        .get(message_index)
+                        .map(|message| message.get_all_text()),
+                    ContextMenuKind::Selection => {
+                        let selected = self.selection_text.borrow().trim().to_string();
+                        if selected.is_empty() {
+                            None
+                        } else {
+                            Some(selected)
+                        }
+                    }
+                };
+
+                if let Some(text) = text {
+                    if crate::message_copy::copy_to_clipboard(&text) {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            format!("Copied {} chars to clipboard.", text.len()),
+                            Some(3),
+                        );
+                    } else {
+                        self.notifications.push(
+                            NotificationKind::Warning,
+                            "Failed to copy to clipboard.".to_string(),
+                            Some(3),
+                        );
+                    }
+                    debug!("Copy action triggered, text: {} chars", text.len());
+                }
+            }
+            ContextMenuItem::Fork => {
+                if let ContextMenuKind::Message { message_index } = kind {
+                    let branch_point = message_index + 1;
+                    self.prompt_input.replace_text(format!("/fork {}", branch_point));
+                    self.status_message =
+                        Some(format!("Fork at message {} - press Enter to confirm", branch_point));
+                }
+            }
+        }
+    }
+
+    /// Process mouse events (trackpad scroll, text selection, etc.).
+    pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
+        use crossterm::event::MouseButton;
+
+        // Fast-reject mouse-move events — they flood at 60+ Hz and we don't
+        // need hover tracking. Exception: context menu needs hover to update
+        // the selected item highlight.
+        if matches!(mouse_event.kind, MouseEventKind::Moved) {
+            if let Some(menu) = self.context_menu_state.as_mut() {
+                let items = Self::context_menu_items(menu.kind);
+                let item_labels: Vec<&str> = items.iter().map(|i| match i {
+                    ContextMenuItem::Copy => "Copy",
+                    ContextMenuItem::Fork => "Fork new chat",
+                }).collect();
+                let menu_width = (item_labels.iter().map(|l| l.len()).max().unwrap_or(4) + 4) as u16;
+                let menu_height = items.len() as u16 + 2;
+                let screen = self.last_msg_area.get();
+                let menu_x = menu.x.min(screen.x.saturating_add(screen.width).saturating_sub(menu_width + 1));
+                let menu_y = menu.y.min(screen.y.saturating_add(screen.height).saturating_sub(menu_height + 1));
+                let inner_y = menu_y + 1;
+                let col = mouse_event.column;
+                let row = mouse_event.row;
+                if col >= menu_x
+                    && col < menu_x.saturating_add(menu_width)
+                    && row >= inner_y
+                    && row < inner_y.saturating_add(items.len() as u16)
+                {
+                    let hovered = (row - inner_y) as usize;
+                    if hovered < items.len() {
+                        menu.selected_index = hovered;
+                    }
+                }
+            }
+            return;
+        }
+
+        // ---- Dialog interaction: dismiss on click-outside, scroll/click inside ----
+        // Key-input and device-auth stay outside this gate so their visible text
+        // can still be selected and copied with the mouse.
+        let any_dialog = self.connect_dialog.visible
+            || self.command_palette.visible
+            || self.model_picker.visible
+            || self.export_dialog.visible
+            || self.settings_screen.visible
+            || self.stats_dialog.open
+            || self.context_viz.visible
+            || self.session_browser.visible;
+
+        if any_dialog {
+            match mouse_event.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // DialogSelect dialogs — check if click is inside for item selection
+                    let in_dialog = if self.connect_dialog.visible {
+                        self.connect_dialog.contains(mouse_event.column, mouse_event.row)
+                    } else if self.command_palette.visible {
+                        self.command_palette.contains(mouse_event.column, mouse_event.row)
+                    } else {
+                        // Other dialogs (model_picker, settings, export, etc.) —
+                        // treat any click as "inside" to prevent accidental dismiss.
+                        // User must press Esc to close these.
+                        true
+                    };
+
+                    if in_dialog {
+                        // Click inside a DialogSelect — select the clicked item
+                        if self.connect_dialog.visible {
+                            self.connect_dialog.handle_mouse_click(mouse_event.row);
+                        } else if self.command_palette.visible {
+                            self.command_palette.handle_mouse_click(mouse_event.row);
+                        }
+                        // Other dialogs: click absorbed, no action needed
+                    } else {
+                        // Click outside a DialogSelect — dismiss and restore input focus
+                        self.close_secondary_views();
+                        self.focus = FocusTarget::Input;
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    // Scroll through dialog items
+                    if self.connect_dialog.visible { self.connect_dialog.move_up(); }
+                    else if self.command_palette.visible { self.command_palette.move_up(); }
+                }
+                MouseEventKind::ScrollDown => {
+                    if self.connect_dialog.visible { self.connect_dialog.move_down(); }
+                    else if self.command_palette.visible { self.command_palette.move_down(); }
+                }
+                _ => {}
+            }
+            return; // Don't process any other mouse events when a dialog is open
+        }
+
+        match mouse_event.kind {
+            MouseEventKind::ScrollUp => {
+                // Don't consume Ctrl+Scroll — let the terminal handle zoom.
+                if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
+                    let step = self.scroll_step();
+                    self.scroll_offset = self.scroll_offset.saturating_add(step);
+                    self.auto_scroll = false;
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
+                    let step = self.scroll_step();
+                    let new_off = self.scroll_offset.saturating_sub(step);
+                    self.scroll_offset = new_off;
+                    if new_off == 0 {
+                        self.auto_scroll = true;
+                        self.new_messages_while_scrolled = 0;
+                    }
+                }
+            }
+            // ---- Right-click context menu ----------------------------------
+            MouseEventKind::Down(MouseButton::Right) => {
+                let msg_area = self.last_msg_area.get();
+                let has_selection = !self.selection_text.borrow().trim().is_empty();
+                if mouse_event.column >= msg_area.x
+                    && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
+                    && mouse_event.row >= msg_area.y
+                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height)
+                {
+                    if let Some(message_index) = self.message_index_at_row(mouse_event.row) {
+                        self.show_context_menu(
+                            mouse_event.column,
+                            mouse_event.row,
+                            ContextMenuKind::Message { message_index },
+                        );
+                    } else {
+                        self.dismiss_context_menu();
+                    }
+                } else if has_selection {
+                    self.show_context_menu(
+                        mouse_event.column,
+                        mouse_event.row,
+                        ContextMenuKind::Selection,
+                    );
+                } else {
+                    self.dismiss_context_menu();
+                }
+            }
+
+            // ---- Text selection / focus routing -------------------------
+            MouseEventKind::Down(MouseButton::Left) => {
+                // If a context menu is open, check if the click is on a menu item.
+                // Must replicate the same position clamping as the renderer.
+                if let Some(menu) = self.context_menu_state {
+                    let items = Self::context_menu_items(menu.kind);
+                    let item_labels: Vec<&str> = items.iter().map(|i| match i {
+                        ContextMenuItem::Copy => "Copy",
+                        ContextMenuItem::Fork => "Fork new chat",
+                    }).collect();
+                    let menu_width = (item_labels.iter().map(|l| l.len()).max().unwrap_or(4) + 4) as u16;
+                    let menu_height = items.len() as u16 + 2; // +2 for border
+                    // Clamp to screen bounds (same as render_context_menu)
+                    let screen = self.last_msg_area.get();
+                    let menu_x = menu.x.min(screen.x.saturating_add(screen.width).saturating_sub(menu_width + 1));
+                    let menu_y = menu.y.min(screen.y.saturating_add(screen.height).saturating_sub(menu_height + 1));
+                    let col = mouse_event.column;
+                    let row = mouse_event.row;
+                    // Inner area starts 1 past the border
+                    let inner_y = menu_y + 1;
+                    if col >= menu_x
+                        && col < menu_x.saturating_add(menu_width)
+                        && row >= inner_y
+                        && row < inner_y.saturating_add(items.len() as u16)
+                    {
+                        let clicked_index = (row - inner_y) as usize;
+                        if clicked_index < items.len() {
+                            self.context_menu_state.as_mut().unwrap().selected_index = clicked_index;
+                            self.execute_context_menu_item();
+                            return;
+                        }
+                    }
+                    // Click was outside the menu — just dismiss it
+                    self.dismiss_context_menu();
+                    return;
+                }
+
+                let input_area = self.last_input_area.get();
+                let selectable_area = self.last_selectable_area.get();
+
+                let in_input = input_area.width > 0 && input_area.height > 0
+                    && mouse_event.row >= input_area.y
+                    && mouse_event.row < input_area.y.saturating_add(input_area.height)
+                    && mouse_event.column >= input_area.x
+                    && mouse_event.column < input_area.x.saturating_add(input_area.width);
+
+                let in_selectable = selectable_area.width > 0 && selectable_area.height > 0
+                    && mouse_event.row >= selectable_area.y
+                    && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
+                    && mouse_event.column >= selectable_area.x
+                    && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
+
+                if in_input {
+                    self.focus = FocusTarget::Input;
+                    self.clear_selection();
+                } else if selectable_area.width == 0 || selectable_area.height == 0 {
+                    self.click_count = 0;
+                } else if in_selectable {
+                    self.focus = FocusTarget::Transcript;
+
+                    let current_pos = (mouse_event.column, mouse_event.row);
+                    let now = std::time::Instant::now();
+
+                    // Check for double-click
+                    if self.is_double_click(current_pos) {
+                        self.click_count += 1;
+                        if self.click_count >= 3 {
+                            // Triple-click: select entire line
+                            self.selection_anchor = Some((selectable_area.x, current_pos.1));
+                            self.selection_focus = Some((
+                                selectable_area
+                                    .x
+                                    .saturating_add(selectable_area.width)
+                                    .saturating_sub(1),
+                                current_pos.1,
+                            ));
+                            self.click_count = 0; // Reset for next click sequence
+                        } else {
+                            // Double-click: select word
+                            if let Some((start, end)) = self.find_word_boundaries(current_pos.0, current_pos.1) {
+                                self.selection_anchor = Some((start, current_pos.1));
+                                self.selection_focus = Some((end, current_pos.1));
+                            }
+                        }
+                    } else {
+                        // Single click or new click sequence
+                        self.click_count = 1;
+                        self.selection_anchor = Some(current_pos);
+                        self.selection_focus = Some(current_pos);
+                        *self.selection_text.borrow_mut() = String::new();
+                    }
+
+                    self.last_click_time = Some(now);
+                    self.last_click_position = Some(current_pos);
+                } else {
+                    self.click_count = 0;
+                    self.clear_selection();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Dismiss context menu on drag
+                self.dismiss_context_menu();
+
+                // Continue drag — clamp to the selectable frame bounds so dragging
+                // outside extends selection to the edge rather than cancelling.
+                if self.selection_anchor.is_some() {
+                    let selectable_area = self.last_selectable_area.get();
+                    if selectable_area.width > 0 && selectable_area.height > 0 {
+                        let clamped_col = mouse_event.column
+                            .max(selectable_area.x)
+                            .min(selectable_area.x.saturating_add(selectable_area.width).saturating_sub(1));
+                        let clamped_row = mouse_event.row
+                            .max(selectable_area.y)
+                            .min(selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1));
+                        self.selection_focus = Some((clamped_col, clamped_row));
+                        self.click_count = 0; // Reset on drag to prevent further double-clicks
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Clear if no actual drag (single click = no selection)
+                if self.selection_anchor == self.selection_focus {
+                    self.clear_selection();
+                }
+            }
+            _ => {}
+        }
+    }
+
     // -------------------------------------------------------------------
     // Query event handling
     // -------------------------------------------------------------------
@@ -2790,34 +4821,41 @@ impl App {
                 if !self.is_streaming {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
                     self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
-                    self.turn_start = Some(std::time::Instant::now());
-                    self.last_turn_elapsed = None;
-                    self.last_turn_verb = None;
+                    // Only set turn_start on the FIRST streaming event of a
+                    // turn.  MessageStop resets is_streaming between tool-use
+                    // cycles, but we must not reset the timer — the total turn
+                    // duration should cover the entire request, including all
+                    // tool-use rounds.
+                    if self.turn_start.is_none() {
+                        self.turn_start = Some(std::time::Instant::now());
+                        self.last_turn_elapsed = None;
+                        self.last_turn_verb = None;
+                    }
+                    self.streaming_thinking.clear();
                 }
                 self.is_streaming = true;
                 match stream_evt {
-                    cc_api::StreamEvent::ContentBlockDelta { delta, .. } => {
+                    claurst_api::AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
                         // Reset stall timer on any incoming delta — we're making progress.
                         self.stall_start = None;
                         match delta {
-                            cc_api::streaming::ContentDelta::TextDelta { text } => {
+                            claurst_api::streaming::ContentDelta::TextDelta { text } => {
                                 self.streaming_text.push_str(&text);
                                 self.invalidate_transcript();
                             }
-                            cc_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
+                            claurst_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
                                 debug!(len = thinking.len(), "Thinking delta received");
+                                self.streaming_thinking.push_str(&thinking);
+                                self.invalidate_transcript();
                             }
                             _ => {}
                         }
                     }
-                    cc_api::StreamEvent::MessageStop => {
+                    claurst_api::AnthropicStreamEvent::MessageStop => {
                         self.is_streaming = false;
                         self.spinner_verb = None;
                         self.stall_start = None;
-                        if !self.streaming_text.is_empty() {
-                            let text = std::mem::take(&mut self.streaming_text);
-                            self.push_assistant_message(text);
-                        }
+                        self.flush_streamed_assistant_message();
                     }
                     _ => {
                         // Any other stream event: if we have no stall_start yet,
@@ -2836,9 +4874,11 @@ impl App {
                 }
                 self.is_streaming = true;
                 self.status_message = Some(format!("Running {}…", tool_name));
+                let turn_index = self.current_user_turn_index();
                 if let Some(existing) =
                     self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id)
                 {
+                    existing.turn_index = turn_index;
                     existing.status = ToolStatus::Running;
                     existing.output_preview = None;
                     existing.input_json = input_json;
@@ -2846,6 +4886,7 @@ impl App {
                     self.tool_use_blocks.push(ToolUseBlock {
                         id: tool_id,
                         name: tool_name,
+                        turn_index,
                         status: ToolStatus::Running,
                         output_preview: None,
                         input_json,
@@ -2887,22 +4928,28 @@ impl App {
                 self.refresh_turn_diff_from_history();
             }
 
-            QueryEvent::TurnComplete { turn, stop_reason, .. } => {
+            QueryEvent::TurnComplete { turn, stop_reason, usage, .. } => {
                 debug!(turn, stop_reason, "Turn complete");
                 self.is_streaming = false;
                 self.spinner_verb = None;
+
+                // Update context window usage from the usage info.
+                if let Some(ref u) = usage {
+                    let turn_tokens = u.input_tokens + u.output_tokens
+                        + u.cache_creation_input_tokens + u.cache_read_input_tokens;
+                    self.context_used_tokens = self.context_used_tokens.saturating_add(turn_tokens);
+                }
                 // Record elapsed time and pick a completion verb
-                if let Some(start) = self.turn_start.take() {
-                    let secs = start.elapsed().as_secs();
-                    let seed = self.frame_count as usize ^ (self.messages.len() * 7);
-                    self.last_turn_elapsed = Some(format_elapsed(secs));
-                    self.last_turn_verb = Some(sample_completion_verb(seed));
-                }
-                if !self.streaming_text.is_empty() {
-                    let text = std::mem::take(&mut self.streaming_text);
-                    self.push_assistant_message(text);
-                }
+                let seed = self.frame_count as usize ^ (self.messages.len() * 7);
+                let elapsed = self.turn_start.take()
+                    .map(|start| format_elapsed_ms(start.elapsed().as_millis()));
+                self.last_turn_elapsed = Some(
+                    elapsed.unwrap_or_else(|| "0s".to_string())
+                );
+                self.last_turn_verb = Some(sample_completion_verb(seed));
+                self.flush_streamed_assistant_message();
                 self.tool_use_blocks.retain(|b| b.status != ToolStatus::Running);
+                self.complete_current_turn_snapshot(stop_reason.contains("abort") || stop_reason.contains("cancel"));
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();
             }
@@ -2915,34 +4962,45 @@ impl App {
                 self.is_streaming = false;
                 self.spinner_verb = None;
                 self.streaming_text.clear();
+                self.streaming_thinking.clear();
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
                 self.status_message = Some(err_msg);
             }
             QueryEvent::TokenWarning { state, pct_used } => {
-                // Display a status bar warning when approaching the context limit.
-                use cc_query::compact::TokenWarningState;
-                let msg = match state {
-                    TokenWarningState::Ok => None,
-                    TokenWarningState::Warning => Some(format!(
-                        "Context window {:.0}% full — consider /compact",
-                        pct_used * 100.0
-                    )),
-                    TokenWarningState::Critical => Some(format!(
-                        "Context window {:.0}% full — /compact recommended now",
-                        pct_used * 100.0
-                    )),
-                };
-                if let Some(warning) = msg {
-                    self.status_message = Some(warning);
+                // Push a notification for context window warnings (notification + threshold tracking).
+                use claurst_query::compact::TokenWarningState;
+
+                // Only escalate — never repeat a threshold already shown.
+                match state {
+                    TokenWarningState::Ok => {
+                        // Reset threshold tracking when back to normal
+                        self.token_warning_threshold_shown = 0;
+                    }
+                    TokenWarningState::Warning if self.token_warning_threshold_shown < 80 => {
+                        self.token_warning_threshold_shown = 80;
+                        self.notifications.push(
+                            NotificationKind::Warning,
+                            format!("Context window {:.0}% full. Consider /compact.", pct_used * 100.0),
+                            Some(30),
+                        );
+                    }
+                    TokenWarningState::Critical if self.token_warning_threshold_shown < 95 => {
+                        self.token_warning_threshold_shown = 95;
+                        self.notifications.push(
+                            NotificationKind::Error,
+                            format!("Context window {:.0}% full! Run /compact now.", pct_used * 100.0),
+                            None,
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Re-sync token count from tracker and check warning thresholds.
+        // Update token count from tracker.
         self.token_count = self.cost_tracker.total_tokens() as u32;
-        self.check_token_warnings();
     }
 
     // -------------------------------------------------------------------
@@ -2964,18 +5022,183 @@ impl App {
 
             // Expire old notifications
             self.notifications.tick();
+            self.memory_update_notification.tick();
 
             // Drain background model-fetch results (non-blocking).
             if let Some(ref mut rx) = self.model_fetch_rx {
-                if let Ok(entries) = rx.try_recv() {
-                    let current = self.model_name.clone();
-                    self.model_picker.set_models(entries);
-                    // Re-apply the current-model highlight so it stays accurate.
-                    for m in &mut self.model_picker.models {
-                        m.is_current = m.id == current;
+                match rx.try_recv() {
+                    Ok(Ok(entries)) => {
+                        let provider = self
+                            .config
+                            .provider
+                            .clone()
+                            .unwrap_or_else(|| "anthropic".to_string());
+                        let provider_prefix = format!("{}/", provider);
+                        let current = self
+                            .model_name
+                            .strip_prefix(&provider_prefix)
+                            .unwrap_or(self.model_name.as_str())
+                            .to_string();
+                        self.model_picker.set_models(entries);
+                        // Re-apply the current-model highlight so it stays accurate.
+                        for m in &mut self.model_picker.models {
+                            m.is_current = m.id == current;
+                        }
+                        self.model_fetch_rx = None;
                     }
-                    self.model_fetch_rx = None;
+                    Ok(Err(()))
+                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.model_picker.loading_models = false;
+                        self.model_fetch_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
                 }
+            }
+
+            // Spawn async provider model-list fetch when requested.
+            if self.model_picker_fetch_pending {
+                self.model_picker_fetch_pending = false;
+                let provider_id_str = self.config.provider.clone().unwrap_or_else(|| "anthropic".to_string());
+                if let Some(ref registry) = self.provider_registry {
+                    let pid = claurst_core::ProviderId::new(&provider_id_str);
+                    if let Some(provider) = registry.get(&pid) {
+                        let provider = provider.clone();
+                        let (tx, rx) = tokio::sync::mpsc::channel(1);
+                        self.model_fetch_rx = Some(rx);
+                        self.model_picker.loading_models = true;
+                        tokio::spawn(async move {
+                            match provider.list_models().await {
+                                Ok(models) => {
+                                    let entries: Vec<crate::model_picker::ModelEntry> = models
+                                        .into_iter()
+                                        .map(|m| {
+                                            let ctx_k = m.context_window / 1000;
+                                            crate::model_picker::ModelEntry {
+                                                id: m.id.to_string(),
+                                                display_name: m.name.clone(),
+                                                description: format!("{}K context", ctx_k),
+                                                is_current: false,
+                                            }
+                                        })
+                                        .collect();
+                                    let _ = tx.send(Ok(entries)).await;
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(Err(())).await;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            // Drain background session-list results.
+            if let Some(ref mut rx) = self.session_list_rx {
+                match rx.try_recv() {
+                    Ok(entries) => {
+                        self.session_browser.sessions = entries;
+                        self.session_browser.selected_idx = 0;
+                        self.session_list_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.session_list_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+
+            // Spawn async session-list load when requested.
+            if self.session_list_pending {
+                self.session_list_pending = false;
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                self.session_list_rx = Some(rx);
+                tokio::spawn(async move {
+                    let sessions = claurst_core::history::list_sessions().await;
+                    let entries: Vec<crate::session_browser::SessionEntry> = sessions
+                        .into_iter()
+                        .map(|s| {
+                            let age = chrono::Utc::now()
+                                .signed_duration_since(s.updated_at);
+                            let last_updated = if age.num_minutes() < 1 {
+                                "just now".to_string()
+                            } else if age.num_hours() < 1 {
+                                format!("{}m ago", age.num_minutes())
+                            } else if age.num_hours() < 24 {
+                                format!("{}h ago", age.num_hours())
+                            } else {
+                                format!("{}d ago", age.num_days())
+                            };
+                            crate::session_browser::SessionEntry {
+                                id: s.id,
+                                title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
+                                last_updated,
+                                message_count: s.messages.len(),
+                                cost_usd: s.total_cost,
+                            }
+                        })
+                        .collect();
+                    let _ = tx.send(entries).await;
+                });
+            }
+
+            // Drain voice transcription events (non-blocking).
+            // When the background recording/transcription task emits a
+            // TranscriptReady event we insert the text directly into the
+            // prompt so the user can review and submit it.
+            {
+                use claurst_core::voice::VoiceEvent;
+                let mut events = Vec::new();
+                if let Some(ref mut rx) = self.voice_event_rx {
+                    while let Ok(ev) = rx.try_recv() {
+                        events.push(ev);
+                    }
+                }
+                for ev in events {
+                    match ev {
+                        VoiceEvent::RecordingStarted => {
+                            self.voice_recording = true;
+                            self.status_message =
+                                Some("Recording\u{2026} press V again or Enter to stop".to_string());
+                        }
+                        VoiceEvent::RecordingStopped => {
+                            self.voice_recording = false;
+                            self.status_message =
+                                Some("Transcribing\u{2026}".to_string());
+                        }
+                        VoiceEvent::TranscriptReady(text) => {
+                            if !text.is_empty() {
+                                // Append to existing prompt text with a space separator
+                                // so the user can combine voice + typed input.
+                                if !self.prompt_input.text.is_empty()
+                                    && !self.prompt_input.text.ends_with(' ')
+                                {
+                                    self.prompt_input.paste(" ");
+                                }
+                                self.prompt_input.paste(&text);
+                                self.refresh_prompt_input();
+                                self.status_message = Some(
+                                    format!("Transcribed: {}", &text[..text.len().min(60)])
+                                );
+                            }
+                            // Clear the channel once we have the result.
+                            self.voice_event_rx = None;
+                        }
+                        VoiceEvent::Error(msg) => {
+                            self.voice_recording = false;
+                            self.voice_event_rx = None;
+                            self.notifications.push(
+                                NotificationKind::Warning,
+                                format!("Voice: {}", msg),
+                                Some(8),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Refresh task list if the overlay is visible (every frame for live updates)
+            if self.tasks_overlay.visible {
+                self.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
             }
 
             // Draw the frame
@@ -2985,8 +5208,20 @@ impl App {
             if event::poll(std::time::Duration::from_millis(50))? {
                 match event::read()? {
                     Event::Key(key) => {
-                        // On Windows crossterm fires Press + Release; only handle Press.
+                        // On Windows crossterm fires both Press and Release events.
+                        // We normally skip non-press events, but when voice PTT mode
+                        // is active we need the Release event for the `V` key so we
+                        // can stop recording as soon as the user lifts the key.
                         if key.kind != crossterm::event::KeyEventKind::Press {
+                            // Handle V-key release to stop PTT recording.
+                            if key.kind == crossterm::event::KeyEventKind::Release
+                                && key.code == KeyCode::Char('v')
+                                && key.modifiers == KeyModifiers::NONE
+                                && self.voice_recording
+                                && self.voice_recorder.is_some()
+                            {
+                                self.handle_voice_ptt_stop();
+                            }
                             continue;
                         }
                         let should_submit = self.handle_key_event(key);
@@ -3027,67 +5262,91 @@ impl App {
                         self.refresh_prompt_input();
                     }
                     Event::Mouse(mouse_event) => {
-                        use crossterm::event::MouseButton;
-                        match mouse_event.kind {
-                            MouseEventKind::ScrollUp => {
-                                // Don't consume Ctrl+Scroll — let the terminal handle zoom.
-                                if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
-                                    let step = self.scroll_step();
-                                    self.scroll_offset = self.scroll_offset.saturating_add(step);
-                                    self.auto_scroll = false;
-                                    self.selection_anchor = None;
-                                    self.selection_focus = None;
-                                }
-                            }
-                            MouseEventKind::ScrollDown => {
-                                if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
-                                    let step = self.scroll_step();
-                                    let new_off = self.scroll_offset.saturating_sub(step);
-                                    self.scroll_offset = new_off;
-                                    if new_off == 0 {
-                                        self.auto_scroll = true;
-                                        self.new_messages_while_scrolled = 0;
-                                    }
-                                    self.selection_anchor = None;
-                                    self.selection_focus = None;
-                                }
-                            }
-                            // ---- Text selection ---------------------------------
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                self.selection_anchor = Some((mouse_event.column, mouse_event.row));
-                                self.selection_focus = Some((mouse_event.column, mouse_event.row));
-                                *self.selection_text.borrow_mut() = String::new();
-                            }
-                            MouseEventKind::Drag(MouseButton::Left) => {
-                                if self.selection_anchor.is_some() {
-                                    self.selection_focus = Some((mouse_event.column, mouse_event.row));
-                                }
-                            }
-                            MouseEventKind::Up(MouseButton::Left) => {
-                                // Clear if no actual drag (single click = no selection)
-                                if self.selection_anchor == self.selection_focus {
-                                    self.selection_anchor = None;
-                                    self.selection_focus = None;
-                                }
-                            }
-                            _ => {}
-                        }
+                        self.handle_mouse_event(mouse_event);
                     }
                     _ => {}
                 }
             }
         }
     }
+
+    // ========== NEW KEYBINDING HELPER FUNCTIONS (Phase 1) ==========
+
+    /// Jump to the next error/issue in messages.
+    /// Searches for common error indicators: "Error:", "ERROR:", "error", "failed", "FAIL".
+    fn jump_to_next_error(&mut self) {
+        const ERROR_KEYWORDS: &[&str] = &["error:", "failed:", "fail"];
+
+        // Search forward from current position
+        for i in 0..self.messages.len() {
+            let msg = &self.messages[i];
+            let content = msg.get_all_text().to_lowercase();
+
+            // Check if message contains error keywords
+            let has_error = ERROR_KEYWORDS.iter().any(|keyword| {
+                content.contains(keyword)
+            });
+
+            if has_error && i > (self.messages.len().saturating_sub(self.scroll_offset / 2)) {
+                // Found an error message, scroll to it
+                let new_offset = self.messages.len().saturating_sub(i);
+                self.scroll_offset = new_offset.saturating_mul(2);
+                self.auto_scroll = false;
+                self.status_message = Some(format!("Error found in message {}", i + 1));
+                return;
+            }
+        }
+
+        self.status_message = Some("No more errors found.".to_string());
+    }
+
+    /// Jump to the previous error/issue in messages.
+    /// Searches backwards for common error indicators.
+    fn jump_to_previous_error(&mut self) {
+        const ERROR_KEYWORDS: &[&str] = &["error:", "failed:", "fail"];
+
+        // Search backward from current position
+        for i in (0..self.messages.len()).rev() {
+            let msg = &self.messages[i];
+            let content = msg.get_all_text().to_lowercase();
+
+            // Check if message contains error keywords
+            let has_error = ERROR_KEYWORDS.iter().any(|keyword| {
+                content.contains(keyword)
+            });
+
+            if has_error && i < (self.messages.len().saturating_sub(self.scroll_offset / 2)) {
+                // Found an error message, scroll to it
+                let new_offset = self.messages.len().saturating_sub(i);
+                self.scroll_offset = new_offset.saturating_mul(2);
+                self.auto_scroll = false;
+                self.status_message = Some(format!("Error found in message {}", i + 1));
+                return;
+            }
+        }
+
+        self.status_message = Some("No previous errors found.".to_string());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     fn make_app() -> App {
         let config = Config::default();
-        let cost_tracker = cc_core::cost::CostTracker::new();
+        let cost_tracker = claurst_core::cost::CostTracker::new();
         App::new(config, cost_tracker)
+    }
+
+    fn press_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
     }
 
     #[test]
@@ -3148,6 +5407,54 @@ mod tests {
         assert_eq!(app.output_style, "auto");
     }
 
+    #[test]
+    fn test_context_menu_fork_targets_clicked_message() {
+        let mut app = make_app();
+        app.add_message(Role::User, "one".to_string());
+        app.add_message(Role::Assistant, "two".to_string());
+        app.add_message(Role::User, "three".to_string());
+
+        app.handle_context_menu_action(
+            ContextMenuItem::Fork,
+            ContextMenuKind::Message { message_index: 1 },
+        );
+
+        assert_eq!(app.prompt_input.text, "/fork 2");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Fork at message 2 - press Enter to confirm")
+        );
+    }
+
+    #[test]
+    fn test_right_click_targets_row_message_instead_of_last_message() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        });
+        app.message_row_map.borrow_mut().insert(3, 1);
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 12,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(matches!(
+            app.context_menu_state,
+            Some(ContextMenuState {
+                kind: ContextMenuKind::Message { message_index: 1 },
+                ..
+            })
+        ));
+    }
+
     // ---- Help overlay -------------------------------------------------------
 
     #[test]
@@ -3155,6 +5462,7 @@ mod tests {
         let mut app = make_app();
         assert!(!app.help_overlay.visible);
         assert!(!app.show_help);
+        assert!(!app.help_overlay.commands.is_empty());
         assert!(app.intercept_slash_command("help"));
         assert!(app.help_overlay.visible);
         assert!(app.show_help);
@@ -3169,6 +5477,65 @@ mod tests {
         // Second call while already open should leave it open (not toggle it off).
         assert!(app.intercept_slash_command("help"));
         assert!(app.help_overlay.visible);
+    }
+
+    #[test]
+    fn test_question_mark_shortcut_opens_help_with_shift_modifier() {
+        let mut app = make_app();
+
+        app.handle_key_event(press_key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+
+        assert!(app.help_overlay.visible);
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn test_question_mark_shortcut_closes_help_with_shift_modifier() {
+        let mut app = make_app();
+        app.help_overlay.toggle();
+        app.show_help = true;
+
+        app.handle_key_event(press_key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+
+        assert!(!app.help_overlay.visible);
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn test_question_mark_shortcut_types_into_non_empty_prompt() {
+        let mut app = make_app();
+        app.prompt_input.text = "why".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+
+        assert!(!app.help_overlay.visible);
+        assert_eq!(app.prompt_input.text, "why?");
+    }
+
+    #[test]
+    fn test_ctrl_a_shortcut_opens_model_picker() {
+        let mut app = make_app();
+        app.has_credentials = true;
+        app.config.provider = Some("anthropic".to_string());
+
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+
+        assert!(app.model_picker.visible);
+    }
+
+    #[test]
+    fn test_ctrl_k_shortcut_opens_command_palette_even_with_input() {
+        let mut app = make_app();
+        app.prompt_input.text = "hello".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+
+        assert!(app.command_palette.visible);
+        assert_eq!(app.prompt_input.text, "hello");
     }
 
     // ---- Bash prefix allowlist ----------------------------------------------

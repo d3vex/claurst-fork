@@ -1,4 +1,8 @@
-// OAuth 2.0 PKCE login flow for the Claude Code CLI.
+// WARNING: The OAuth client IDs in this module are registered to Anthropic's Claude Code CLI.
+// They will not work for Claurst. This module is preserved for reference but disabled.
+// Users should authenticate via API key (/connect → Anthropic → paste key).
+//
+// OAuth 2.0 PKCE login flow for the Claurst CLI.
 //
 // Implements the same flow as the TypeScript OAuthService + authLogin():
 // 1. Generate PKCE code_verifier / code_challenge / state
@@ -9,11 +13,11 @@
 //    b. User manually pastes the authorization code at the terminal
 // 5. Exchange the authorization code for tokens via POST to TOKEN_URL
 // 6. For Console flow: call create_api_key endpoint to get an API key
-// 7. Save OAuthTokens to ~/.claude/oauth_tokens.json
+// 7. Save OAuthTokens to ~/.claurst/oauth_tokens.json
 // 8. Return the credential (API key or Bearer token)
 
 use anyhow::{bail, Context};
-use cc_core::oauth::{self, OAuthTokens};
+use claurst_core::oauth::{self, OAuthTokens};
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -51,6 +55,7 @@ struct CreateApiKeyResponse {
 #[derive(Debug, Clone)]
 pub struct LoginResult {
     /// The credential to use: either an API key (Console flow) or Bearer token (Claude.ai).
+    #[allow(dead_code)]
     pub credential: String,
     /// When true, present as `Authorization: Bearer <credential>`.
     pub use_bearer_auth: bool,

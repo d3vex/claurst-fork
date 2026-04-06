@@ -1,12 +1,12 @@
 [package]
-name = "cc-tools"
+name = "claurst-tools"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cc-core = { workspace = true }
-cc-api = { workspace = true }
-cc-mcp = { workspace = true }
+claurst-core = { workspace = true }
+claurst-api = { workspace = true }
+claurst-mcp = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
@@ -35,6 +35,12 @@ base64 = { workspace = true }
 open = { workspace = true }
 enigo = { workspace = true, optional = true }
 xcap = { workspace = true, optional = true }
+
+# PTY support — used by PtyBashTool on Unix
+portable-pty = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
 
 [features]
 computer-use = ["dep:enigo", "dep:xcap"]
